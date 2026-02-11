@@ -60,12 +60,6 @@ const NO_CONTENT_CHALLENGE_HEADER: &str = "X-Iroh-Challenge";
 const NO_CONTENT_RESPONSE_HEADER: &str = "X-Iroh-Response";
 const NOTFOUND: &[u8] = b"Not Found";
 const ROBOTS_TXT: &[u8] = b"User-agent: *\nDisallow: /\n";
-const INDEX: &[u8] = br#"<html><body>
-<h1>Iroh Relay</h1>
-<p>
-  This is an <a href="https://iroh.computer/">Iroh</a> Relay server.
-</p>
-"#;
 const TLS_HEADERS: [(&str, &str); 2] = [
     (
         "Strict-Transport-Security",
@@ -610,14 +604,44 @@ async fn relay_supervisor(
 }
 
 fn root_handler(
-    _r: Request<Incoming>,
+    r: Request<Incoming>,
     response: ResponseBuilder,
 ) -> HyperResult<Response<BytesBody>> {
+    let region = relay_region_from_request(&r);
+    let body = render_origin_index_html(region.as_deref());
     response
         .status(StatusCode::OK)
         .header("Content-Type", "text/html; charset=utf-8")
-        .body(INDEX.into())
+        .body(body.into())
         .map_err(|err| Box::new(err) as HyperError)
+}
+
+fn relay_region_from_request(r: &Request<Incoming>) -> Option<String> {
+    let host = r.headers().get(http::header::HOST)?.to_str().ok()?;
+    let host = host.split(':').next().unwrap_or(host);
+    let region = host.split('.').next()?;
+    if region.len() > 32 || region.is_empty() {
+        return None;
+    }
+    if !region
+        .as_bytes()
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+    {
+        return None;
+    }
+    if !region.contains('-') {
+        return None;
+    }
+    Some(region.to_string())
+}
+
+fn render_origin_index_html(region: Option<&str>) -> hyper::body::Bytes {
+    let region = region.unwrap_or("unknown-region");
+    let html = format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Origin Relay</title><style>body{{margin:0;min-height:100vh;display:grid;place-items:center;background:linear-gradient(160deg,#0b1116,#121b22);color:#e8eef4;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,\\\"Liberation Mono\\\",\\\"Courier New\\\",monospace}}main{{max-width:720px;padding:28px 24px;border:1px solid rgba(144,185,218,.28);border-radius:14px;background:rgba(7,12,16,.72);box-shadow:0 18px 42px rgba(0,0,0,.34)}}h1{{margin:0 0 10px;font-size:1.65rem}}p{{margin:0 0 10px;line-height:1.55;color:#c4d4e2}}.k{{color:#90b9da}}a{{color:#7cc4ff;text-decoration:none}}a:hover{{text-decoration:underline}}.links{{display:flex;gap:18px;margin-top:14px;flex-wrap:wrap}}</style></head><body><main><h1>Origin Relay</h1><p>Local-first, peer-to-peer byte storage with a durable timeline.</p><p>This endpoint serves Origin relay transport for node connectivity, discovery reachability, and sync traffic.</p><p><span class=\"k\">Region:</span> {region}</p><div class=\"links\"><a href=\"https://origin.dhiway.com\">Visit origin.dhiway.com</a><a href=\"https://origin.dhiway.com/docs\">Read the docs</a></div></main></body></html>"
+    );
+    hyper::body::Bytes::from(html)
 }
 
 /// HTTP latency queries
