@@ -526,7 +526,7 @@ pub(crate) mod pkarr_dns_state {
 
         #[test]
         fn test_endpoint_id_from_domain_name() -> Result {
-            let name = "_iroh.dgjpkxyn3zyrk3zfads5duwdgbqpkwbjxfj4yt7rezidr3fijccy.dns.iroh.link.";
+            let name = "_origin.dgjpkxyn3zyrk3zfads5duwdgbqpkwbjxfj4yt7rezidr3fijccy.dns.iroh.link.";
             let endpoint_id = super::endpoint_id_from_domain_name(name);
             let expected: EndpointId =
                 "1992d53c02cdc04566e5c0edb1ce83305cd550297953a047a445ea3264b54b18".parse()?;

@@ -357,7 +357,7 @@ mod tests {
         // Fetch as JSON via HTTP.
         let url = format!(
             "{http_url}dns-query?name={}&type=txt",
-            format_args!("_iroh.{name_z32}."),
+            format_args!("_origin.{name_z32}."),
         );
         let res = client
             .get(url)
@@ -369,14 +369,14 @@ mod tests {
             .await
             .anyerr()?;
         assert_eq!(res.answer.len(), 1);
-        assert_eq!(res.answer[0].name, format!("_iroh.{name_z32}."));
+        assert_eq!(res.answer[0].name, format!("_origin.{name_z32}."));
         assert_eq!(res.answer[0].data, format!("relay={RELAY_URL}"));
 
         // Fetch as JSON via HTTPS.
         let https_url = server.https_url().expect("https is bound");
         let url = format!(
             "{https_url}dns-query?name={}&type=txt",
-            format_args!("_iroh.{name_z32}."),
+            format_args!("_origin.{name_z32}."),
         );
         let res = client
             .get(url)
@@ -388,7 +388,7 @@ mod tests {
             .await
             .anyerr()?;
         assert_eq!(res.answer.len(), 1);
-        assert_eq!(res.answer[0].name, format!("_iroh.{name_z32}."));
+        assert_eq!(res.answer[0].name, format!("_origin.{name_z32}."));
         assert_eq!(res.answer[0].data, format!("relay={RELAY_URL}"));
 
         // Fetch over HTTPS via hickory-resolver
@@ -419,7 +419,7 @@ mod tests {
         };
 
         let res = client
-            .txt_lookup(format!("_iroh.{name_z32}."))
+            .txt_lookup(format!("_origin.{name_z32}."))
             .await
             .anyerr()?;
         let records = res.as_lookup().records();

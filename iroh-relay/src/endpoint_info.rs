@@ -5,9 +5,9 @@
 //!
 //! DNS records are published under the following names:
 //!
-//! `_iroh.<z32-endpoint-id>.<origin-domain> TXT`
+//! `_origin.<z32-endpoint-id>.<origin-domain> TXT`
 //!
-//! - `_iroh` is the record name as defined by [`IROH_TXT_NAME`].
+//! - `_origin` is the record name as defined by [`IROH_TXT_NAME`].
 //!
 //! - `<z32-endpoint-id>` is the [z-base-32] encoding of the [`EndpointId`].
 //!
@@ -45,7 +45,7 @@ use n0_error::{e, ensure, stack_error};
 use url::Url;
 
 /// The DNS name for the iroh TXT record.
-pub const IROH_TXT_NAME: &str = "_iroh";
+pub const IROH_TXT_NAME: &str = "_origin";
 
 #[allow(missing_docs)]
 #[stack_error(derive, add_meta)]
@@ -437,7 +437,7 @@ pub enum ParseError {
         #[error(std_err)]
         source: Utf8Error,
     },
-    #[error("Record is not an `iroh` record, expected `_iroh`, got `{label}`")]
+    #[error("Record is not an `iroh` record, expected `_origin`, got `{label}`")]
     NotAnIrohRecord { label: String },
     #[error(transparent)]
     DecodingError { source: DecodingError },
@@ -642,7 +642,7 @@ impl<T: FromStr + Display + Hash + Ord> TxtAttrs<T> {
 }
 
 #[cfg(not(wasm_browser))]
-pub(crate) fn ensure_iroh_txt_label(name: String) -> String {
+pub(crate) fn ensure_origin_txt_label(name: String) -> String {
     let mut parts = name.split(".");
     if parts.next() == Some(IROH_TXT_NAME) {
         name
@@ -717,7 +717,7 @@ mod tests {
     #[test]
     fn test_from_hickory_lookup() -> Result {
         let name = Name::from_utf8(
-            "_iroh.dgjpkxyn3zyrk3zfads5duwdgbqpkwbjxfj4yt7rezidr3fijccy.dns.iroh.link.",
+            "_origin.dgjpkxyn3zyrk3zfads5duwdgbqpkwbjxfj4yt7rezidr3fijccy.dns.iroh.link.",
         )
         .std_context("dns name")?;
         let query = Query::query(name.clone(), RecordType::TXT);
@@ -737,7 +737,7 @@ mod tests {
             // Test a record with a mismatching name
             Record::from_rdata(
                 Name::from_utf8(format!(
-                    "_iroh.{}.dns.iroh.link.",
+                    "_origin.{}.dns.iroh.link.",
                     EndpointId::from_str(
                         // Another EndpointId
                         "a55f26132e5e43de834d534332f66a20d480c3e50a13a312a071adea6569981e"
