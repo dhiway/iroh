@@ -21,6 +21,8 @@ use tokio_rustls_acme::{AcmeConfig, axum::AxumAcceptor, caches::DirCache};
 use tokio_stream::StreamExt;
 use tracing::{Instrument, debug, error, info_span};
 
+pub(super) type Maintenance = BoxFuture<io::Result<()>>;
+
 /// Strategy used to obtain TLS certificates for the HTTPS server.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, strum::Display)]
 #[serde(rename_all = "snake_case")]
@@ -35,21 +37,23 @@ pub enum CertMode {
 }
 
 impl CertMode {
-    /// Build the [`TlsAcceptor`] for this mode.
+    /// Build the native acceptor and return any unstarted maintenance future.
     pub(crate) async fn build(
         &self,
         domains: Vec<String>,
         cert_cache: PathBuf,
         letsencrypt_contact: Option<String>,
         letsencrypt_prod: bool,
-    ) -> Result<TlsAcceptor> {
+    ) -> Result<(TlsAcceptor, Option<Maintenance>)> {
         Ok(match self {
-            CertMode::Manual => TlsAcceptor::manual(domains, cert_cache).await?,
-            CertMode::SelfSigned => TlsAcceptor::self_signed(domains)?,
+            CertMode::Manual => (TlsAcceptor::manual(domains, cert_cache).await?, None),
+            CertMode::SelfSigned => (TlsAcceptor::self_signed(domains)?, None),
             CertMode::LetsEncrypt => {
                 let contact =
                     letsencrypt_contact.context("contact is required for letsencrypt cert mode")?;
-                TlsAcceptor::letsencrypt(domains, &contact, letsencrypt_prod, cert_cache)?
+                let (acceptor, maintenance) =
+                    TlsAcceptor::letsencrypt(domains, &contact, letsencrypt_prod, cert_cache)?;
+                (acceptor, Some(maintenance))
             }
         })
     }
@@ -126,7 +130,7 @@ impl TlsAcceptor {
         contact: &str,
         is_production: bool,
         dir: PathBuf,
-    ) -> Result<Self> {
+    ) -> Result<(Self, Maintenance)> {
         let config = rustls::ServerConfig::builder().with_no_client_auth();
         let mut state = AcmeConfig::new(domains)
             .contact([format!("mailto:{contact}")])
@@ -137,20 +141,20 @@ impl TlsAcceptor {
         let config = config.with_cert_resolver(state.resolver());
         let acceptor = state.acceptor();
 
-        tokio::spawn(
-            async move {
-                loop {
-                    match state.next().await.unwrap() {
-                        Ok(ok) => debug!("acme event: {:?}", ok),
-                        Err(err) => error!("error: {:?}", err),
-                    }
+        let maintenance = async move {
+            while let Some(event) = state.next().await {
+                match event {
+                    Ok(ok) => debug!("acme event: {:?}", ok),
+                    Err(err) => error!("error: {:?}", err),
                 }
             }
-            .instrument(info_span!("acme")),
-        );
+            Err(io::Error::other("ACME event stream ended"))
+        }
+        .instrument(info_span!("acme"))
+        .boxed();
         let config = Arc::new(config);
         let acceptor = AxumAcceptor::new(acceptor, config);
-        Ok(Self::LetsEncrypt(acceptor))
+        Ok((Self::LetsEncrypt(acceptor), maintenance))
     }
 }
 

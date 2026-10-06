@@ -50,6 +50,11 @@ binding; no packet database, LRU or Mainline fallback is created. TLS certificat
 configuration and its native cache still apply. The ordinary `Server::bind` path
 retains its persistent store, publishing and configured fallback behavior.
 
+Constructor preparation binds native sockets and builds TLS without starting
+request-serving or ACME tasks. Cancelled preparation drops unstarted work; all
+DNS, HTTP and ACME start synchronously after the last startup await. ACME maintenance is
+owned with the HTTP tasks and participates in completion, failure and shutdown.
+
 Retain and await `Server::shutdown` or `Server::join` through completion, including
 errors. Cleanup notifies native HTTP connections, cancels native DNS transports,
 awaits listener tasks, and drains entered host lookup futures. That drain proves

@@ -98,13 +98,35 @@ pub(crate) struct DnsServer {
     tcp: hickory_server::Server<DnsHandler>,
 }
 
-impl DnsServer {
-    /// Spawn the server.
-    pub(crate) async fn spawn(config: DnsConfig, dns_handler: DnsHandler) -> Result<Self> {
-        const TCP_TIMEOUT: Duration = Duration::from_millis(1000);
-        let mut udp = hickory_server::Server::new(dns_handler.clone());
-        let mut tcp = hickory_server::Server::new(dns_handler);
+pub(crate) struct PreparedDnsServer {
+    socket: UdpSocket,
+    listener: TcpListener,
+    handler: DnsHandler,
+    local_addr: SocketAddr,
+}
 
+impl PreparedDnsServer {
+    pub(crate) fn start(self) -> DnsServer {
+        const TCP_TIMEOUT: Duration = Duration::from_millis(1000);
+        const TCP_RESPONSE_BUFFER: usize = 64 * 1024;
+        let mut udp = hickory_server::Server::new(self.handler.clone());
+        let mut tcp = hickory_server::Server::new(self.handler);
+        udp.register_socket(self.socket);
+        tcp.register_listener(self.listener, TCP_TIMEOUT, TCP_RESPONSE_BUFFER);
+        DnsServer {
+            udp,
+            tcp,
+            local_addr: self.local_addr,
+        }
+    }
+}
+
+impl DnsServer {
+    /// Bind both transports without registering native serving tasks.
+    pub(crate) async fn prepare(
+        config: DnsConfig,
+        dns_handler: DnsHandler,
+    ) -> Result<PreparedDnsServer> {
         let bind_addr = SocketAddr::new(
             config.bind_addr.unwrap_or(Ipv6Addr::UNSPECIFIED.into()),
             config.port,
@@ -114,17 +136,15 @@ impl DnsServer {
 
         let socket_addr = socket.local_addr().anyerr()?;
 
-        const TCP_RESPONSE_BUFFER: usize = 64 * 1024;
         // Bind both before spawning native transport work. Port zero still means
         // one selected port for both transports, as required by DnsConfig.
         let listener = TcpListener::bind(socket_addr).await.anyerr()?;
-        udp.register_socket(socket);
-        tcp.register_listener(listener, TCP_TIMEOUT, TCP_RESPONSE_BUFFER);
         info!("DNS server listening on {}", bind_addr);
 
-        Ok(Self {
-            udp,
-            tcp,
+        Ok(PreparedDnsServer {
+            socket,
+            listener,
+            handler: dns_handler,
             local_addr: socket_addr,
         })
     }

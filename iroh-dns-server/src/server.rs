@@ -99,7 +99,21 @@ impl Server {
             metrics: metrics.clone(),
         };
 
-        let metrics_server = if let Some(addr) = config.metrics_addr() {
+        let metrics_addr = config.metrics_addr();
+        let http = HttpServer::prepare(
+            config.http,
+            config.https,
+            config.pkarr_put_rate_limit,
+            state.clone(),
+            cert_cache_dir,
+        )
+        .await?;
+        let dns = DnsServer::prepare(config.dns, state.dns_handler.clone()).await?;
+
+        // Metrics owns an abort-on-drop task. Its only preparation await is the
+        // bind; after it returns there is no await before all ownership returns
+        // as Server. No dynamic request or ACME work runs during preparation.
+        let metrics_server = if let Some(addr) = metrics_addr {
             let mut registry = iroh_metrics::Registry::default();
             registry.register(metrics.clone());
             let server =
@@ -109,37 +123,8 @@ impl Server {
             None
         };
 
-        let http_server = match HttpServer::spawn(
-            config.http,
-            config.https,
-            config.pkarr_put_rate_limit,
-            state.clone(),
-            cert_cache_dir,
-        )
-        .await
-        {
-            Ok(server) => server,
-            Err(error) => {
-                backend.cancel();
-                if let Some(server) = metrics_server {
-                    server.shutdown().await;
-                }
-                backend.drain().await;
-                return Err(error);
-            }
-        };
-        let dns_server = match DnsServer::spawn(config.dns, state.dns_handler.clone()).await {
-            Ok(server) => server,
-            Err(error) => {
-                backend.cancel();
-                let _http_cleanup = http_server.shutdown().await;
-                if let Some(server) = metrics_server {
-                    server.shutdown().await;
-                }
-                backend.drain().await;
-                return Err(error);
-            }
-        };
+        let http_server = http.start();
+        let dns_server = dns.start();
 
         Ok(Self {
             http_server,

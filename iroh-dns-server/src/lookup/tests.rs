@@ -575,3 +575,59 @@ async fn unavailable_marker_is_isolated_between_requests_and_tasks() {
         baseline.metadata.response_code
     );
 }
+
+#[test]
+fn native_tsig_record_ttl_is_included_in_whole_packet_expiry() {
+    use hickory_server::proto::rr::{
+        RData, Record,
+        rdata::{TSIG, tsig::TsigAlgorithm},
+    };
+    let secret = SecretKey::from_bytes(&[7; 32]);
+    let mut message = signed_packet_to_hickory_message(&packet(30)).unwrap();
+    // Native TSIG has TTL zero. It is an actual record even when a unified
+    // DNSSEC feature moves it from additionals into Message::signature().
+    message.additionals.push(Record::from_rdata(
+        Name::from_utf8(secret.public().to_z32()).unwrap(),
+        0,
+        RData::TSIG(TSIG::new(
+            TsigAlgorithm::HmacSha256,
+            123,
+            300,
+            vec![],
+            0,
+            None,
+            vec![],
+        )),
+    ));
+    let encoded = message.to_bytes().unwrap();
+    let timestamp = 123u64;
+    let mut signable = format!("3:seqi{timestamp}e1:v{}:", encoded.len()).into_bytes();
+    signable.extend_from_slice(&encoded);
+    let mut bytes = secret.public().as_bytes().to_vec();
+    bytes.extend_from_slice(&secret.sign(&signable).to_bytes());
+    bytes.extend_from_slice(&timestamp.to_be_bytes());
+    bytes.extend_from_slice(&encoded);
+    let native = SignedPacket::from_bytes(&bytes).unwrap();
+    let observed = Instant::now();
+    let lease = PacketLease::new(native, observed, Duration::ZERO, Duration::from_secs(60));
+    assert!(!lease.pkarr_usable_at(|| observed).unwrap());
+}
+
+#[test]
+fn native_signature_field_ttl_cannot_escape_whole_packet_expiry() {
+    use hickory_server::proto::rr::{
+        Record,
+        rdata::{TSIG, tsig::TsigAlgorithm},
+    };
+    let mut message = signed_packet_to_hickory_message(&packet(30)).unwrap();
+    let timing = (Duration::ZERO, Duration::from_secs(60));
+    assert!(PacketLease::records_usable(&message, timing));
+    // Exercise the native feature-unified storage form without enabling a new
+    // runtime feature or interpreting/verifying TSIG cryptography ourselves.
+    message.signature = Some(Box::new(Record::from_rdata(
+        Name::from_utf8("signature.example.").unwrap(),
+        0,
+        TSIG::new(TsigAlgorithm::HmacSha256, 123, 300, vec![], 0, None, vec![]),
+    )));
+    assert!(!PacketLease::records_usable(&message, timing));
+}

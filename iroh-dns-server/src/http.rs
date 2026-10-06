@@ -16,6 +16,7 @@ use axum::{
     routing::get,
 };
 use n0_error::{Result, StdResultExt, anyerr, bail_any};
+use n0_future::{FutureExt, future::Boxed as BoxFuture};
 use serde::{Deserialize, Serialize};
 use socket2::{SockRef, TcpKeepalive};
 use tokio::{net::TcpListener, task::JoinSet};
@@ -97,113 +98,136 @@ pub(crate) struct HttpServer {
     https_addr: Option<SocketAddr>,
 }
 
+/// Owns unstarted native futures. Dropping staged setup destroys these futures
+/// and their sockets without admitting requests or starting certificate work.
+pub(crate) struct PreparedHttpServer {
+    tasks: Vec<BoxFuture<std::io::Result<()>>>,
+    handles: Vec<axum_server::Handle<SocketAddr>>,
+    http_addr: Option<SocketAddr>,
+    https_addr: Option<SocketAddr>,
+}
+
+impl PreparedHttpServer {
+    fn new() -> Self {
+        Self {
+            tasks: Vec::new(),
+            handles: Vec::new(),
+            http_addr: None,
+            https_addr: None,
+        }
+    }
+
+    fn stage_task(&mut self, task: BoxFuture<std::io::Result<()>>) {
+        self.tasks.push(task);
+    }
+
+    pub(crate) fn start(self) -> HttpServer {
+        let mut tasks = JoinSet::new();
+        for task in self.tasks {
+            tasks.spawn(task);
+        }
+        HttpServer {
+            tasks,
+            handles: self.handles,
+            http_addr: self.http_addr,
+            https_addr: self.https_addr,
+        }
+    }
+}
+
 impl HttpServer {
-    /// Spawn the server
-    pub(crate) async fn spawn(
+    /// Bind and prepare native work without starting serving or ACME tasks.
+    pub(crate) async fn prepare(
         http_config: Option<HttpConfig>,
         https_config: Option<HttpsConfig>,
         rate_limit_config: RateLimitConfig,
         state: AppState,
         cert_cache_dir: PathBuf,
-    ) -> Result<HttpServer> {
+    ) -> Result<PreparedHttpServer> {
         if http_config.is_none() && https_config.is_none() {
             bail_any!("Either http or https config is required");
         }
 
         let app = create_app(state, &rate_limit_config);
 
-        let mut tasks = JoinSet::new();
-        let mut handles = Vec::new();
-        let startup: Result<_> = async {
-            // launch http
-            let http_addr = if let Some(config) = http_config {
-                let bind_addr = SocketAddr::new(
-                    config.bind_addr.unwrap_or(Ipv6Addr::UNSPECIFIED.into()),
-                    config.port,
-                );
-                let app = app.clone();
-                let listener = TcpListener::bind(bind_addr)
-                    .await
-                    .anyerr()?
-                    .into_std()
-                    .anyerr()?;
-                let bound_addr = listener.local_addr().anyerr()?;
-                set_keepalive(&listener).anyerr()?;
-                let handle = axum_server::Handle::new();
-                handles.push(handle.clone());
-                let fut = axum_server::from_tcp(listener)?
-                    .handle(handle)
-                    .serve(app.into_make_service_with_connect_info::<SocketAddr>());
-                info!("HTTP server listening on {bind_addr}");
-                tasks.spawn(fut);
-                Some(bound_addr)
-            } else {
-                None
-            };
+        let mut prepared = PreparedHttpServer::new();
+        // prepare HTTP
+        let http_addr = if let Some(config) = http_config {
+            let bind_addr = SocketAddr::new(
+                config.bind_addr.unwrap_or(Ipv6Addr::UNSPECIFIED.into()),
+                config.port,
+            );
+            let app = app.clone();
+            let listener = TcpListener::bind(bind_addr)
+                .await
+                .anyerr()?
+                .into_std()
+                .anyerr()?;
+            let bound_addr = listener.local_addr().anyerr()?;
+            set_keepalive(&listener).anyerr()?;
+            let handle = axum_server::Handle::new();
+            prepared.handles.push(handle.clone());
+            let fut = axum_server::from_tcp(listener)?
+                .handle(handle)
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>());
+            info!("HTTP server bound at {bind_addr}");
+            prepared.stage_task(fut.boxed());
+            Some(bound_addr)
+        } else {
+            None
+        };
 
-            // launch https
-            let https_addr = if let Some(config) = https_config {
-                let bind_addr = SocketAddr::new(
-                    config.bind_addr.unwrap_or(Ipv6Addr::UNSPECIFIED.into()),
-                    config.port,
-                );
-                let acceptor = {
-                    tokio::fs::create_dir_all(&cert_cache_dir)
-                        .await
-                        .with_std_context(|_| {
-                            format!(
-                                "failed to create cert cache dir at {}",
-                                cert_cache_dir.display()
-                            )
-                        })?;
-                    config
-                        .cert_mode
-                        .build(
-                            config.domains,
-                            cert_cache_dir,
-                            config.letsencrypt_contact,
-                            config.letsencrypt_prod.unwrap_or(false),
+        // prepare HTTPs
+        let https_addr = if let Some(config) = https_config {
+            let bind_addr = SocketAddr::new(
+                config.bind_addr.unwrap_or(Ipv6Addr::UNSPECIFIED.into()),
+                config.port,
+            );
+            let (acceptor, maintenance) = {
+                tokio::fs::create_dir_all(&cert_cache_dir)
+                    .await
+                    .with_std_context(|_| {
+                        format!(
+                            "failed to create cert cache dir at {}",
+                            cert_cache_dir.display()
                         )
-                        .await?
-                };
-                let listener = TcpListener::bind(bind_addr)
-                    .await
-                    .anyerr()?
-                    .into_std()
-                    .anyerr()?;
-                let bound_addr = listener.local_addr().anyerr()?;
-                set_keepalive(&listener).anyerr()?;
-                let handle = axum_server::Handle::new();
-                handles.push(handle.clone());
-                let fut = axum_server::from_tcp(listener)?
-                    .handle(handle)
-                    .acceptor(acceptor)
-                    .serve(app.into_make_service_with_connect_info::<SocketAddr>());
-                info!("HTTPS server listening on {bind_addr}");
-                tasks.spawn(fut);
-                Some(bound_addr)
-            } else {
-                None
+                    })?;
+                config
+                    .cert_mode
+                    .build(
+                        config.domains,
+                        cert_cache_dir,
+                        config.letsencrypt_contact,
+                        config.letsencrypt_prod.unwrap_or(false),
+                    )
+                    .await?
             };
-
-            Ok((http_addr, https_addr))
-        }
-        .await;
-        match startup {
-            Ok((http_addr, https_addr)) => Ok(HttpServer {
-                tasks,
-                handles,
-                http_addr,
-                https_addr,
-            }),
-            Err(error) => {
-                for handle in handles {
-                    handle.shutdown();
-                }
-                tasks.shutdown().await;
-                Err(error)
+            if let Some(maintenance) = maintenance {
+                prepared.stage_task(maintenance);
             }
-        }
+            let listener = TcpListener::bind(bind_addr)
+                .await
+                .anyerr()?
+                .into_std()
+                .anyerr()?;
+            let bound_addr = listener.local_addr().anyerr()?;
+            set_keepalive(&listener).anyerr()?;
+            let handle = axum_server::Handle::new();
+            prepared.handles.push(handle.clone());
+            let fut = axum_server::from_tcp(listener)?
+                .handle(handle)
+                .acceptor(acceptor)
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>());
+            info!("HTTPS server bound at {bind_addr}");
+            prepared.stage_task(fut.boxed());
+            Some(bound_addr)
+        } else {
+            None
+        };
+
+        prepared.http_addr = http_addr;
+        prepared.https_addr = https_addr;
+        Ok(prepared)
     }
 
     /// Get the bound address of the HTTP socket.
@@ -233,8 +257,8 @@ impl HttpServer {
     pub(crate) async fn run_until_done(&mut self) -> Result<()> {
         match self.tasks.join_next().await {
             Some(Ok(Ok(()))) | None => Ok(()),
-            Some(Ok(Err(error))) => Err(anyerr!(error, "HTTP listener")),
-            Some(Err(error)) => Err(anyerr!(error, "HTTP listener join")),
+            Some(Ok(Err(error))) => Err(anyerr!(error, "HTTP/TLS task")),
+            Some(Err(error)) => Err(anyerr!(error, "HTTP/TLS task join")),
         }
     }
 
@@ -623,8 +647,147 @@ mod lifecycle_tests {
             http_addr: None,
             https_addr: None,
         };
-        assert!(server.run_until_done().await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), server.run_until_done())
+                .await
+                .expect("first task completion must be prompt")
+                .is_err()
+        );
         assert!(!dropped.load(Ordering::SeqCst));
+        server.shutdown().await.unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+    #[tokio::test]
+    async fn cancelled_staged_startup_destroys_unpolled_serving_and_maintenance() {
+        use std::sync::atomic::AtomicUsize;
+
+        use iroh_base::{PublicKey, SecretKey};
+
+        use crate::{
+            lookup::{Backend, PacketLease, PacketLookup},
+            util::PublicKeyBytes,
+        };
+
+        struct CountingLookup(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl PacketLookup for CountingLookup {
+            async fn lookup(&self, _: PublicKey) -> Result<Option<PacketLease>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            }
+        }
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let backend = Backend::injected(Arc::new(CountingLookup(callbacks.clone())));
+        let key =
+            PublicKeyBytes::new_unchecked(*SecretKey::from_bytes(&[7; 32]).public().as_bytes());
+        let serving_dropped = Arc::new(AtomicBool::new(false));
+        let maintenance_dropped = Arc::new(AtomicBool::new(false));
+        let maintenance_started = Arc::new(AtomicBool::new(false));
+        let serving_witness = DropWitness(serving_dropped.clone());
+        let maintenance_witness = DropWitness(maintenance_dropped.clone());
+        let started = maintenance_started.clone();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let preparation_entered = entered.clone();
+        let mut startup = Box::pin(async move {
+            let mut prepared = PreparedHttpServer::new();
+            // Exercise the production ownership path used by both native serving
+            // and ACME work; stage_task must never spawn or poll either future.
+            prepared.stage_task(
+                async move {
+                    let _witness = serving_witness;
+                    let _ = backend.packet(&key).await;
+                    std::future::pending().await
+                }
+                .boxed(),
+            );
+            prepared.stage_task(
+                async move {
+                    let _witness = maintenance_witness;
+                    started.store(true, Ordering::SeqCst);
+                    std::future::pending().await
+                }
+                .boxed(),
+            );
+            preparation_entered.notify_one();
+            std::future::pending::<()>().await;
+            prepared.start()
+        });
+        tokio::select! {
+            _ = &mut startup => unreachable!("preparation remains pending"),
+            _ = entered.notified() => {},
+        }
+        // Give any prematurely spawned task a scheduling opportunity while
+        // staged ownership remains retained, before cancellation can hide it.
+        tokio::task::yield_now().await;
+        assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+        assert!(!maintenance_started.load(Ordering::SeqCst));
+        assert!(!serving_dropped.load(Ordering::SeqCst));
+        assert!(!maintenance_dropped.load(Ordering::SeqCst));
+        drop(startup);
+        tokio::task::yield_now().await;
+        assert!(serving_dropped.load(Ordering::SeqCst));
+        assert!(maintenance_dropped.load(Ordering::SeqCst));
+        assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+        assert!(!maintenance_started.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn owned_maintenance_is_destroyed_after_shutdown_and_sibling_failure() {
+        for sibling_fails in [false, true] {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let witness = DropWitness(dropped.clone());
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let maintenance_entered = entered.clone();
+            let mut prepared = PreparedHttpServer::new();
+            prepared.stage_task(
+                async move {
+                    let _witness = witness;
+                    maintenance_entered.notify_one();
+                    std::future::pending().await
+                }
+                .boxed(),
+            );
+            if sibling_fails {
+                prepared.stage_task(async { Err(std::io::Error::other("serving failed")) }.boxed());
+            }
+            let mut server = prepared.start();
+            entered.notified().await;
+            if sibling_fails {
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(1), server.run_until_done())
+                        .await
+                        .expect("first task completion must be prompt")
+                        .is_err()
+                );
+            }
+            server.shutdown().await.unwrap();
+            assert!(dropped.load(Ordering::SeqCst));
+        }
+    }
+
+    #[tokio::test]
+    async fn maintenance_failure_is_observed_and_pending_serving_is_drained() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let witness = DropWitness(dropped.clone());
+        let mut prepared = PreparedHttpServer::new();
+        prepared.stage_task(
+            async move {
+                let _witness = witness;
+                std::future::pending().await
+            }
+            .boxed(),
+        );
+        prepared.stage_task(async { Err(std::io::Error::other("maintenance failed")) }.boxed());
+        let mut server = prepared.start();
+        let error = tokio::time::timeout(Duration::from_secs(1), server.run_until_done())
+            .await
+            .expect("maintenance failure must be prompt")
+            .unwrap_err();
+        let cause = std::error::Error::source(&error).unwrap();
+        assert_eq!(
+            cause.downcast_ref::<std::io::Error>().unwrap().to_string(),
+            "maintenance failed"
+        );
         server.shutdown().await.unwrap();
         assert!(dropped.load(Ordering::SeqCst));
     }

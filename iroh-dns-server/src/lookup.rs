@@ -96,6 +96,13 @@ impl PacketLease {
         let Some(timing) = self.timing_at(now()) else {
             return Ok(false);
         };
+        Ok(Self::records_usable(&message, timing))
+    }
+
+    fn records_usable(
+        message: &hickory_server::proto::op::Message,
+        timing: (Duration, Duration),
+    ) -> bool {
         let mut count = 0;
         for record in message
             .answers
@@ -108,10 +115,18 @@ impl PacketLease {
             }
             count += 1;
             if Self::ttl_left(record.ttl, timing).is_none() {
-                return Ok(false);
+                return false;
             }
         }
-        Ok(count > 0)
+        // DNSSEC feature unification can move TSIG out of the section vectors.
+        // Its native TTL remains an actual-record budget, unlike OPT metadata.
+        if let Some(signature) = message.signature() {
+            count += 1;
+            if Self::ttl_left(signature.ttl, timing).is_none() {
+                return false;
+            }
+        }
+        count > 0
     }
 }
 
