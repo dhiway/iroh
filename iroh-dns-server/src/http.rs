@@ -625,6 +625,14 @@ mod lifecycle_tests {
 
     use super::*;
 
+    async fn complete_scenario(future: impl std::future::Future<Output = ()>) {
+        tokio::time::timeout(Duration::from_secs(5), future)
+            .await
+            .expect(
+                "the complete lifecycle scenario must finish, including notification and cleanup",
+            );
+    }
+
     struct DropWitness(Arc<AtomicBool>);
     impl Drop for DropWitness {
         fn drop(&mut self) {
@@ -633,162 +641,175 @@ mod lifecycle_tests {
     }
     #[tokio::test]
     async fn first_error_is_prompt_and_shutdown_destroys_sibling_task() {
-        let dropped = Arc::new(AtomicBool::new(false));
-        let witness = DropWitness(dropped.clone());
-        let mut tasks = JoinSet::new();
-        tasks.spawn(async move {
-            let _witness = witness;
-            std::future::pending::<std::io::Result<()>>().await
-        });
-        tasks.spawn(async { Err(std::io::Error::other("listener failed")) });
-        let mut server = HttpServer {
-            tasks,
-            handles: vec![],
-            http_addr: None,
-            https_addr: None,
-        };
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), server.run_until_done())
-                .await
-                .expect("first task completion must be prompt")
-                .is_err()
-        );
-        assert!(!dropped.load(Ordering::SeqCst));
-        server.shutdown().await.unwrap();
-        assert!(dropped.load(Ordering::SeqCst));
+        complete_scenario(async {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let witness = DropWitness(dropped.clone());
+            let mut tasks = JoinSet::new();
+            tasks.spawn(async move {
+                let _witness = witness;
+                std::future::pending::<std::io::Result<()>>().await
+            });
+            tasks.spawn(async { Err(std::io::Error::other("listener failed")) });
+            let mut server = HttpServer {
+                tasks,
+                handles: vec![],
+                http_addr: None,
+                https_addr: None,
+            };
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), server.run_until_done())
+                    .await
+                    .expect("first task completion must be prompt")
+                    .is_err()
+            );
+            assert!(!dropped.load(Ordering::SeqCst));
+            server.shutdown().await.unwrap();
+            assert!(dropped.load(Ordering::SeqCst));
+        })
+        .await;
     }
     #[tokio::test]
     async fn cancelled_staged_startup_destroys_unpolled_serving_and_maintenance() {
-        use std::sync::atomic::AtomicUsize;
+        complete_scenario(async {
+            use std::sync::atomic::AtomicUsize;
 
-        use iroh_base::{PublicKey, SecretKey};
+            use iroh_base::{PublicKey, SecretKey};
 
-        use crate::{
-            lookup::{Backend, PacketLease, PacketLookup},
-            util::PublicKeyBytes,
-        };
+            use crate::{
+                lookup::{Backend, PacketLease, PacketLookup},
+                util::PublicKeyBytes,
+            };
 
-        struct CountingLookup(Arc<AtomicUsize>);
-        #[async_trait::async_trait]
-        impl PacketLookup for CountingLookup {
-            async fn lookup(&self, _: PublicKey) -> Result<Option<PacketLease>> {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Ok(None)
+            struct CountingLookup(Arc<AtomicUsize>);
+            #[async_trait::async_trait]
+            impl PacketLookup for CountingLookup {
+                async fn lookup(&self, _: PublicKey) -> Result<Option<PacketLease>> {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Ok(None)
+                }
             }
-        }
-        let callbacks = Arc::new(AtomicUsize::new(0));
-        let backend = Backend::injected(Arc::new(CountingLookup(callbacks.clone())));
-        let key =
-            PublicKeyBytes::new_unchecked(*SecretKey::from_bytes(&[7; 32]).public().as_bytes());
-        let serving_dropped = Arc::new(AtomicBool::new(false));
-        let maintenance_dropped = Arc::new(AtomicBool::new(false));
-        let maintenance_started = Arc::new(AtomicBool::new(false));
-        let serving_witness = DropWitness(serving_dropped.clone());
-        let maintenance_witness = DropWitness(maintenance_dropped.clone());
-        let started = maintenance_started.clone();
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let preparation_entered = entered.clone();
-        let mut startup = Box::pin(async move {
-            let mut prepared = PreparedHttpServer::new();
-            // Exercise the production ownership path used by both native serving
-            // and ACME work; stage_task must never spawn or poll either future.
-            prepared.stage_task(
-                async move {
-                    let _witness = serving_witness;
-                    let _ = backend.packet(&key).await;
-                    std::future::pending().await
-                }
-                .boxed(),
-            );
-            prepared.stage_task(
-                async move {
-                    let _witness = maintenance_witness;
-                    started.store(true, Ordering::SeqCst);
-                    std::future::pending().await
-                }
-                .boxed(),
-            );
-            preparation_entered.notify_one();
-            std::future::pending::<()>().await;
-            prepared.start()
-        });
-        tokio::select! {
-            _ = &mut startup => unreachable!("preparation remains pending"),
-            _ = entered.notified() => {},
-        }
-        // Give any prematurely spawned task a scheduling opportunity while
-        // staged ownership remains retained, before cancellation can hide it.
-        tokio::task::yield_now().await;
-        assert_eq!(callbacks.load(Ordering::SeqCst), 0);
-        assert!(!maintenance_started.load(Ordering::SeqCst));
-        assert!(!serving_dropped.load(Ordering::SeqCst));
-        assert!(!maintenance_dropped.load(Ordering::SeqCst));
-        drop(startup);
-        tokio::task::yield_now().await;
-        assert!(serving_dropped.load(Ordering::SeqCst));
-        assert!(maintenance_dropped.load(Ordering::SeqCst));
-        assert_eq!(callbacks.load(Ordering::SeqCst), 0);
-        assert!(!maintenance_started.load(Ordering::SeqCst));
+            let callbacks = Arc::new(AtomicUsize::new(0));
+            let backend = Backend::injected(Arc::new(CountingLookup(callbacks.clone())));
+            let key =
+                PublicKeyBytes::new_unchecked(*SecretKey::from_bytes(&[7; 32]).public().as_bytes());
+            let serving_dropped = Arc::new(AtomicBool::new(false));
+            let maintenance_dropped = Arc::new(AtomicBool::new(false));
+            let maintenance_started = Arc::new(AtomicBool::new(false));
+            let serving_witness = DropWitness(serving_dropped.clone());
+            let maintenance_witness = DropWitness(maintenance_dropped.clone());
+            let started = maintenance_started.clone();
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let preparation_entered = entered.clone();
+            let mut startup = Box::pin(async move {
+                let mut prepared = PreparedHttpServer::new();
+                // Exercise the production ownership path used by both native serving
+                // and ACME work; stage_task must never spawn or poll either future.
+                prepared.stage_task(
+                    async move {
+                        let _witness = serving_witness;
+                        let _ = backend.packet(&key).await;
+                        std::future::pending().await
+                    }
+                    .boxed(),
+                );
+                prepared.stage_task(
+                    async move {
+                        let _witness = maintenance_witness;
+                        started.store(true, Ordering::SeqCst);
+                        std::future::pending().await
+                    }
+                    .boxed(),
+                );
+                preparation_entered.notify_one();
+                std::future::pending::<()>().await;
+                prepared.start()
+            });
+            tokio::select! {
+                _ = &mut startup => unreachable!("preparation remains pending"),
+                _ = entered.notified() => {},
+            }
+            // Give any prematurely spawned task a scheduling opportunity while
+            // staged ownership remains retained, before cancellation can hide it.
+            tokio::task::yield_now().await;
+            assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+            assert!(!maintenance_started.load(Ordering::SeqCst));
+            assert!(!serving_dropped.load(Ordering::SeqCst));
+            assert!(!maintenance_dropped.load(Ordering::SeqCst));
+            drop(startup);
+            tokio::task::yield_now().await;
+            assert!(serving_dropped.load(Ordering::SeqCst));
+            assert!(maintenance_dropped.load(Ordering::SeqCst));
+            assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+            assert!(!maintenance_started.load(Ordering::SeqCst));
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn owned_maintenance_is_destroyed_after_shutdown_and_sibling_failure() {
-        for sibling_fails in [false, true] {
-            let dropped = Arc::new(AtomicBool::new(false));
-            let witness = DropWitness(dropped.clone());
-            let entered = Arc::new(tokio::sync::Notify::new());
-            let maintenance_entered = entered.clone();
-            let mut prepared = PreparedHttpServer::new();
-            prepared.stage_task(
-                async move {
-                    let _witness = witness;
-                    maintenance_entered.notify_one();
-                    std::future::pending().await
-                }
-                .boxed(),
-            );
-            if sibling_fails {
-                prepared.stage_task(async { Err(std::io::Error::other("serving failed")) }.boxed());
-            }
-            let mut server = prepared.start();
-            entered.notified().await;
-            if sibling_fails {
-                assert!(
-                    tokio::time::timeout(Duration::from_secs(1), server.run_until_done())
-                        .await
-                        .expect("first task completion must be prompt")
-                        .is_err()
+        complete_scenario(async {
+            for sibling_fails in [false, true] {
+                let dropped = Arc::new(AtomicBool::new(false));
+                let witness = DropWitness(dropped.clone());
+                let entered = Arc::new(tokio::sync::Notify::new());
+                let maintenance_entered = entered.clone();
+                let mut prepared = PreparedHttpServer::new();
+                prepared.stage_task(
+                    async move {
+                        let _witness = witness;
+                        maintenance_entered.notify_one();
+                        std::future::pending().await
+                    }
+                    .boxed(),
                 );
+                if sibling_fails {
+                    prepared
+                        .stage_task(async { Err(std::io::Error::other("serving failed")) }.boxed());
+                }
+                let mut server = prepared.start();
+                entered.notified().await;
+                if sibling_fails {
+                    assert!(
+                        tokio::time::timeout(Duration::from_secs(1), server.run_until_done())
+                            .await
+                            .expect("first task completion must be prompt")
+                            .is_err()
+                    );
+                }
+                server.shutdown().await.unwrap();
+                assert!(dropped.load(Ordering::SeqCst));
             }
-            server.shutdown().await.unwrap();
-            assert!(dropped.load(Ordering::SeqCst));
-        }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn maintenance_failure_is_observed_and_pending_serving_is_drained() {
-        let dropped = Arc::new(AtomicBool::new(false));
-        let witness = DropWitness(dropped.clone());
-        let mut prepared = PreparedHttpServer::new();
-        prepared.stage_task(
-            async move {
-                let _witness = witness;
-                std::future::pending().await
-            }
-            .boxed(),
-        );
-        prepared.stage_task(async { Err(std::io::Error::other("maintenance failed")) }.boxed());
-        let mut server = prepared.start();
-        let error = tokio::time::timeout(Duration::from_secs(1), server.run_until_done())
-            .await
-            .expect("maintenance failure must be prompt")
-            .unwrap_err();
-        let cause = std::error::Error::source(&error).unwrap();
-        assert_eq!(
-            cause.downcast_ref::<std::io::Error>().unwrap().to_string(),
-            "maintenance failed"
-        );
-        server.shutdown().await.unwrap();
-        assert!(dropped.load(Ordering::SeqCst));
+        complete_scenario(async {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let witness = DropWitness(dropped.clone());
+            let mut prepared = PreparedHttpServer::new();
+            prepared.stage_task(
+                async move {
+                    let _witness = witness;
+                    std::future::pending().await
+                }
+                .boxed(),
+            );
+            prepared.stage_task(async { Err(std::io::Error::other("maintenance failed")) }.boxed());
+            let mut server = prepared.start();
+            let error = tokio::time::timeout(Duration::from_secs(1), server.run_until_done())
+                .await
+                .expect("maintenance failure must be prompt")
+                .unwrap_err();
+            let cause = std::error::Error::source(&error).unwrap();
+            assert_eq!(
+                cause.downcast_ref::<std::io::Error>().unwrap().to_string(),
+                "maintenance failed"
+            );
+            server.shutdown().await.unwrap();
+            assert!(dropped.load(Ordering::SeqCst));
+        })
+        .await;
     }
 }

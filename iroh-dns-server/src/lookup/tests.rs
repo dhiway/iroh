@@ -428,6 +428,92 @@ async fn native_dns_positive_exposes_aged_ttl() {
 }
 
 #[tokio::test]
+async fn doh_get_head_and_conditionals_reconsult_host_without_caching() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let original = packet(30);
+        let name = format!("_iroh.{}.irohdns.example.", original.public_key().to_z32());
+        let mut query = Message::query();
+        query.add_query(Query::query(
+            Name::from_utf8(&name).unwrap(),
+            RecordType::TXT,
+        ));
+        let wire_uri = format!(
+            "/dns-query?dns={}",
+            base64_url::encode(&query.to_bytes().unwrap())
+        );
+        let json_uri = format!("/dns-query?name={name}&type=TXT");
+        let host = host(None);
+        let app = app(Backend::injected(host.clone()));
+        let mut expected_calls = 0;
+        for (uri, accept) in [
+            (wire_uri, "application/dns-message"),
+            (json_uri, "application/dns-json"),
+        ] {
+            for method in ["GET", "HEAD"] {
+                for condition in [
+                    None,
+                    Some(("if-none-match", "*")),
+                    Some(("if-modified-since", "Fri, 01 Jan 2100 00:00:00 GMT")),
+                ] {
+                    // Observe a usable record, remove available evidence, then recover.
+                    // Neither a cached positive nor a cached failure may skip admission.
+                    for available in [true, false, true] {
+                        *host.view.lock().unwrap() = available.then(|| lease(original.clone()));
+                        let mut request = request(method, &uri, vec![]);
+                        request
+                            .headers_mut()
+                            .insert("accept", accept.parse().unwrap());
+                        if let Some((name, value)) = condition {
+                            request.headers_mut().insert(name, value.parse().unwrap());
+                        }
+                        let response = app.clone().oneshot(request).await.unwrap();
+                        expected_calls += 1;
+                        assert_eq!(
+                            host.calls.load(Ordering::SeqCst),
+                            expected_calls,
+                            "{method} {accept}: conditional={condition:?}, available={available}"
+                        );
+                        // DNS errors are still carried in HTTP 200, never 304.
+                        assert_eq!(response.status(), StatusCode::OK);
+                        assert_eq!(response.headers()["cache-control"], "no-store");
+                        assert_eq!(response.headers()["content-type"], accept);
+                        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                        if method == "HEAD" {
+                            assert!(bytes.is_empty());
+                        } else if accept == "application/dns-message" {
+                            let message = Message::from_bytes(&bytes).unwrap();
+                            assert_eq!(
+                                message.metadata.response_code,
+                                if available {
+                                    ResponseCode::NoError
+                                } else {
+                                    ResponseCode::ServFail
+                                }
+                            );
+                            assert_eq!(message.answers.len(), usize::from(available));
+                            if !available {
+                                assert!(message.authorities.is_empty());
+                            }
+                        } else {
+                            let message: serde_json::Value =
+                                serde_json::from_slice(&bytes).unwrap();
+                            assert_eq!(message["Status"], if available { 0 } else { 2 });
+                            if available {
+                                assert_eq!(message["Answer"].as_array().unwrap().len(), 1);
+                            } else {
+                                assert!(message.get("Answer").is_none());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("DoH request variants must complete without an external service");
+}
+
+#[tokio::test]
 async fn default_store_pkarr_miss_publish_and_native_bytes_remain_available() {
     let store = ZoneStore::in_memory(
         crate::store::Options::default(),
