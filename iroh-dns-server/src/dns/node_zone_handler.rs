@@ -17,7 +17,7 @@ use n0_error::{Result, StackResultExt, StdResultExt, bail_any};
 use tracing::{debug, trace};
 
 use crate::{
-    store::ZoneStore,
+    lookup::Backend,
     util::{PublicKeyBytes, record_set_append_origin},
 };
 
@@ -27,7 +27,7 @@ pub(super) struct NodeZoneHandler {
     origins: Vec<Name>,
     #[debug("InMemoryZoneHandler")]
     static_zone_handler: InMemoryZoneHandler,
-    zones: ZoneStore,
+    zones: Backend,
     // TODO: This is used by ZoneHandler::origin
     // Find out what exactly this is used for - we don't have a primary origin.
     first_origin: LowerName,
@@ -35,7 +35,7 @@ pub(super) struct NodeZoneHandler {
 
 impl NodeZoneHandler {
     pub(super) fn new(
-        zones: ZoneStore,
+        zones: Backend,
         static_zone_handler: InMemoryZoneHandler,
         origins: Vec<Name>,
         serial: u32,
@@ -70,11 +70,16 @@ impl NodeZoneHandler {
         lookup_options: LookupOptions,
     ) -> Result<AuthLookup, LookupError> {
         debug!(%origin, %pubkey, %name, "resolve in pkarr zones");
+        let failure = if self.zones.is_injected() {
+            err_servfail
+        } else {
+            err_refused
+        };
         match self
             .zones
             .resolve(&pubkey, &name, record_type)
             .await
-            .map_err(err_refused)?
+            .map_err(failure)?
         {
             Some(pkarr_set) => {
                 debug!(%origin, %pubkey, %name, "found {} records in pkarr zone", pkarr_set.records_without_rrsigs().count());
@@ -86,6 +91,7 @@ impl NodeZoneHandler {
                 let answers = AuthLookup::answers(records, None);
                 Ok(answers)
             }
+            None if self.zones.is_injected() => Err(err_servfail("unavailable")),
             None => Err(err_nx_domain("not found")),
         }
     }
@@ -218,4 +224,11 @@ fn err_refused(e: impl fmt::Debug) -> LookupError {
 fn err_nx_domain(e: impl fmt::Debug) -> LookupError {
     trace!("lookup failed (nxdomain): {e:?}");
     LookupError::from(ResponseCode::NXDomain)
+}
+
+fn err_servfail(e: impl fmt::Debug) -> LookupError {
+    trace!("lookup failed (servfail): {e:?}");
+    super::mark_dynamic_unavailable();
+    // Catalog must take its supported early-error path before native writing.
+    LookupError::from(ResponseCode::Refused)
 }

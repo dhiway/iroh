@@ -59,6 +59,7 @@ ttl_cache = "0.5.1"
 url = "2.5.3"
 
 [dev-dependencies]
+tower = { version = "=0.5.3", features = ["util"] }
 criterion = "0.8.0"
 data-encoding = "2.3.3"
 iroh = { path = "../iroh" }
@@ -102,6 +103,9 @@ all-features = true
 [package.metadata.cargo_check_external_types]
 allowed_external_types = [
     "iroh_metrics::*",
+    # Native embedding exposes the original key and signed packet, not a second wire encoding.
+    "iroh_base::key::PublicKey",
+    "iroh_dns::pkarr::SignedPacket",
     "n0_error::*",
     "serde_core::*",
 ]

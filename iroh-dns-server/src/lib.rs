@@ -8,6 +8,11 @@
 //! With the mainline fallback enabled, keys missing from the local store are
 //! looked up on the BitTorrent mainline DHT.
 //!
+//! Embedded hosts can use [`Server::bind_with_lookup`] with [`PacketLookup`] and
+//! [`PacketLease`] to supply per-request admission without the packet store or
+//! Mainline fallback. The host owns authority and freshness policy; native wire
+//! formats and static zones stay the same.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -27,13 +32,18 @@
 pub mod config;
 mod dns;
 mod http;
+mod lookup;
 mod metrics;
 mod server;
 mod state;
 mod store;
 mod util;
 
-pub use crate::{metrics::Metrics, server::Server};
+pub use crate::{
+    lookup::{PacketLease, PacketLookup},
+    metrics::Metrics,
+    server::Server,
+};
 
 #[cfg(test)]
 mod tests {

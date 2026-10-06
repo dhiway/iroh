@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, State},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
 use bytes::Bytes;
 use http::{StatusCode, header};
@@ -26,8 +26,11 @@ pub(super) async fn put(
         )
     })?;
 
-    let updated = state
-        .store
+    let store = state
+        .backend
+        .store()
+        .ok_or_else(|| AppError::with_status(StatusCode::METHOD_NOT_ALLOWED))?;
+    let updated = store
         .insert(signed_packet, PacketSource::PkarrPublish)
         .await?;
     info!(key = %label, ?updated, "pkarr upsert");
@@ -37,15 +40,22 @@ pub(super) async fn put(
 pub(super) async fn get(
     State(state): State<AppState>,
     Path(pubkey): Path<String>,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<Response, AppError> {
     let pubkey = PublicKeyBytes::from_z32(&pubkey)
         .map_err(|e| AppError::new(StatusCode::BAD_REQUEST, Some(format!("invalid key: {e}"))))?;
-    let signed_packet = state
-        .store
-        .get_signed_packet(&pubkey)
-        .await?
-        .ok_or_else(|| AppError::with_status(StatusCode::NOT_FOUND))?;
+    let signed_packet = match state.backend.packet(&pubkey).await {
+        Ok(Some(packet)) => packet,
+        Ok(None) if state.backend.is_injected() => {
+            return Ok(StatusCode::SERVICE_UNAVAILABLE.into_response());
+        }
+        Err(error) if state.backend.is_injected() => {
+            crate::lookup::Backend::report_unavailable(&error);
+            return Ok(StatusCode::SERVICE_UNAVAILABLE.into_response());
+        }
+        Ok(None) => return Err(AppError::with_status(StatusCode::NOT_FOUND)),
+        Err(error) => return Err(error.into()),
+    };
     let body = signed_packet.to_relay_payload();
     let headers = [(header::CONTENT_TYPE, "application/x-pkarr-signed-packet")];
-    Ok((headers, body))
+    Ok((headers, body).into_response())
 }

@@ -3,7 +3,10 @@
 use std::{
     collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -32,7 +35,7 @@ use tokio::{
 use tracing::{debug, info};
 
 use self::node_zone_handler::NodeZoneHandler;
-use crate::{metrics::Metrics, store::ZoneStore};
+use crate::{lookup::Backend, metrics::Metrics};
 
 mod node_zone_handler;
 
@@ -89,15 +92,18 @@ impl DnsConfig {
 #[derive(derive_more::Debug)]
 pub(crate) struct DnsServer {
     local_addr: SocketAddr,
-    #[debug("hickory_server::Server<DnsHandler>")]
-    server: hickory_server::Server<DnsHandler>,
+    #[debug("hickory_server::Server<DnsHandler> (UDP)")]
+    udp: hickory_server::Server<DnsHandler>,
+    #[debug("hickory_server::Server<DnsHandler> (TCP)")]
+    tcp: hickory_server::Server<DnsHandler>,
 }
 
 impl DnsServer {
     /// Spawn the server.
     pub(crate) async fn spawn(config: DnsConfig, dns_handler: DnsHandler) -> Result<Self> {
         const TCP_TIMEOUT: Duration = Duration::from_millis(1000);
-        let mut server = hickory_server::Server::new(dns_handler);
+        let mut udp = hickory_server::Server::new(dns_handler.clone());
+        let mut tcp = hickory_server::Server::new(dns_handler);
 
         let bind_addr = SocketAddr::new(
             config.bind_addr.unwrap_or(Ipv6Addr::UNSPECIFIED.into()),
@@ -109,16 +115,16 @@ impl DnsServer {
         let socket_addr = socket.local_addr().anyerr()?;
 
         const TCP_RESPONSE_BUFFER: usize = 64 * 1024;
-        server.register_socket(socket);
-        server.register_listener(
-            TcpListener::bind(bind_addr).await.anyerr()?,
-            TCP_TIMEOUT,
-            TCP_RESPONSE_BUFFER,
-        );
+        // Bind both before spawning native transport work. Port zero still means
+        // one selected port for both transports, as required by DnsConfig.
+        let listener = TcpListener::bind(socket_addr).await.anyerr()?;
+        udp.register_socket(socket);
+        tcp.register_listener(listener, TCP_TIMEOUT, TCP_RESPONSE_BUFFER);
         info!("DNS server listening on {}", bind_addr);
 
         Ok(Self {
-            server,
+            udp,
+            tcp,
             local_addr: socket_addr,
         })
     }
@@ -130,16 +136,25 @@ impl DnsServer {
 
     /// Shutdown the server an wait for all tasks to complete.
     pub(crate) async fn shutdown(mut self) -> Result<()> {
-        self.server.shutdown_gracefully().await.anyerr()?;
+        let (udp, tcp) = tokio::join!(
+            self.udp.shutdown_gracefully(),
+            self.tcp.shutdown_gracefully()
+        );
+        udp.anyerr()?;
+        tcp.anyerr()?;
         Ok(())
     }
 
     /// Wait for all tasks to complete.
     ///
     /// Runs forever unless tasks fail.
-    pub(crate) async fn run_until_done(mut self) -> Result<()> {
-        self.server.block_until_done().await.anyerr()?;
-        Ok(())
+    pub(crate) async fn run_until_done(&mut self) -> Result<()> {
+        // One native handle per transport lets ordinary transport errors report
+        // promptly instead of waiting forever for the other live transport.
+        tokio::select! {
+            result = self.udp.block_until_done() => result.anyerr(),
+            result = self.tcp.block_until_done() => result.anyerr(),
+        }
     }
 }
 
@@ -155,7 +170,7 @@ impl DnsHandler {
     /// Create a DNS server given some settings, a connection to the DB for DID-by-username lookups
     /// and the server DID to serve under `_did.<origin>`.
     pub(crate) fn new(
-        zone_store: ZoneStore,
+        zone_store: impl Into<Backend>,
         config: &DnsConfig,
         metrics: Arc<Metrics>,
     ) -> Result<Self> {
@@ -168,7 +183,7 @@ impl DnsHandler {
 
         let (static_authority, serial) = create_static_authority(&origins, config)?;
         let authority = Arc::new(NodeZoneHandler::new(
-            zone_store,
+            zone_store.into(),
             static_authority,
             origins,
             serial,
@@ -214,9 +229,17 @@ impl RequestHandler for DnsHandler {
         }
         debug!(protocol=%request.protocol(), queries=?request.queries, "incoming DNS request");
 
-        let res = self
-            .catalog
-            .handle_request::<_, T>(request, response_handle)
+        let unavailable = Arc::new(AtomicBool::new(false));
+        let response_handle = AdmissionResponse {
+            inner: response_handle,
+            unavailable: unavailable.clone(),
+        };
+        let res = DYNAMIC_UNAVAILABLE
+            .scope(
+                unavailable,
+                self.catalog
+                    .handle_request::<_, T>(request, response_handle),
+            )
             .await;
         match res.response_code {
             ResponseCode::NoError => match res.counts().answers {
@@ -227,6 +250,46 @@ impl RequestHandler for DnsHandler {
             _ => self.metrics.dns_lookup_error.inc(),
         };
         res
+    }
+}
+
+// Hickory 0.26.3 Catalog's authoritative path turns ServFail lookup errors into
+// NoError/NODATA with a negative SOA. Refused is its supported early return.
+// Keep the native writer and alter only a marked injected unavailable response;
+// revisit this adapter when that upstream limitation is fixed.
+tokio::task_local! {
+    static DYNAMIC_UNAVAILABLE: Arc<AtomicBool>;
+}
+
+fn mark_dynamic_unavailable() {
+    let _ = DYNAMIC_UNAVAILABLE.try_with(|marker| marker.store(true, Ordering::Relaxed));
+}
+
+#[derive(Clone)]
+struct AdmissionResponse<R> {
+    inner: R,
+    unavailable: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl<R: ResponseHandler> ResponseHandler for AdmissionResponse<R> {
+    async fn send_response<'a>(
+        &mut self,
+        mut response: MessageResponse<
+            '_,
+            'a,
+            impl Iterator<Item = &'a proto::rr::Record> + Send + 'a,
+            impl Iterator<Item = &'a proto::rr::Record> + Send + 'a,
+            impl Iterator<Item = &'a proto::rr::Record> + Send + 'a,
+            impl Iterator<Item = &'a proto::rr::Record> + Send + 'a,
+        >,
+    ) -> Result<ResponseInfo, NetError> {
+        if self.unavailable.load(Ordering::Relaxed)
+            && response.metadata().response_code == ResponseCode::Refused
+        {
+            response.metadata_mut().response_code = ResponseCode::ServFail;
+        }
+        self.inner.send_response(response).await
     }
 }
 
@@ -309,4 +372,40 @@ fn push_record(records: &mut BTreeMap<RrKey, RecordSet>, serial: u32, record: Re
     let mut record_set = RecordSet::new(record.name.clone(), record.record_type(), serial);
     record_set.insert(record, serial);
     records.insert(key, record_set);
+}
+
+#[cfg(test)]
+mod admission_response_tests {
+    use hickory_server::{
+        proto::serialize::binary::{BinDecodable, BinEncodable},
+        zone_handler::MessageResponseBuilder,
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn unmarked_native_refused_is_not_relabelled() {
+        let (tx, mut rx) = broadcast::channel(1);
+        let mut response = AdmissionResponse {
+            inner: Handle(tx),
+            unavailable: Arc::new(AtomicBool::new(false)),
+        };
+        let query = Request::from_bytes(
+            proto::op::Message::query().to_bytes().unwrap(),
+            "127.0.0.1:1234".parse().unwrap(),
+            Protocol::Https,
+        )
+        .unwrap();
+        let native = MessageResponseBuilder::new(&query.queries, None)
+            .error_msg(&query.metadata, ResponseCode::Refused);
+        response.send_response(native).await.unwrap();
+        let bytes = rx.recv().await.unwrap();
+        assert_eq!(
+            proto::op::Message::from_bytes(&bytes)
+                .unwrap()
+                .metadata
+                .response_code,
+            ResponseCode::Refused
+        );
+    }
 }

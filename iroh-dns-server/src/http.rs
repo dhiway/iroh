@@ -92,6 +92,7 @@ pub struct HttpsConfig {
 #[derive(Debug)]
 pub(crate) struct HttpServer {
     tasks: JoinSet<std::io::Result<()>>,
+    handles: Vec<axum_server::Handle<SocketAddr>>,
     http_addr: Option<SocketAddr>,
     https_addr: Option<SocketAddr>,
 }
@@ -112,77 +113,97 @@ impl HttpServer {
         let app = create_app(state, &rate_limit_config);
 
         let mut tasks = JoinSet::new();
-
-        // launch http
-        let http_addr = if let Some(config) = http_config {
-            let bind_addr = SocketAddr::new(
-                config.bind_addr.unwrap_or(Ipv6Addr::UNSPECIFIED.into()),
-                config.port,
-            );
-            let app = app.clone();
-            let listener = TcpListener::bind(bind_addr)
-                .await
-                .anyerr()?
-                .into_std()
-                .anyerr()?;
-            let bound_addr = listener.local_addr().anyerr()?;
-            set_keepalive(&listener).anyerr()?;
-            let fut = axum_server::from_tcp(listener)?
-                .serve(app.into_make_service_with_connect_info::<SocketAddr>());
-            info!("HTTP server listening on {bind_addr}");
-            tasks.spawn(fut);
-            Some(bound_addr)
-        } else {
-            None
-        };
-
-        // launch https
-        let https_addr = if let Some(config) = https_config {
-            let bind_addr = SocketAddr::new(
-                config.bind_addr.unwrap_or(Ipv6Addr::UNSPECIFIED.into()),
-                config.port,
-            );
-            let acceptor = {
-                tokio::fs::create_dir_all(&cert_cache_dir)
+        let mut handles = Vec::new();
+        let startup: Result<_> = async {
+            // launch http
+            let http_addr = if let Some(config) = http_config {
+                let bind_addr = SocketAddr::new(
+                    config.bind_addr.unwrap_or(Ipv6Addr::UNSPECIFIED.into()),
+                    config.port,
+                );
+                let app = app.clone();
+                let listener = TcpListener::bind(bind_addr)
                     .await
-                    .with_std_context(|_| {
-                        format!(
-                            "failed to create cert cache dir at {}",
-                            cert_cache_dir.display()
-                        )
-                    })?;
-                config
-                    .cert_mode
-                    .build(
-                        config.domains,
-                        cert_cache_dir,
-                        config.letsencrypt_contact,
-                        config.letsencrypt_prod.unwrap_or(false),
-                    )
-                    .await?
+                    .anyerr()?
+                    .into_std()
+                    .anyerr()?;
+                let bound_addr = listener.local_addr().anyerr()?;
+                set_keepalive(&listener).anyerr()?;
+                let handle = axum_server::Handle::new();
+                handles.push(handle.clone());
+                let fut = axum_server::from_tcp(listener)?
+                    .handle(handle)
+                    .serve(app.into_make_service_with_connect_info::<SocketAddr>());
+                info!("HTTP server listening on {bind_addr}");
+                tasks.spawn(fut);
+                Some(bound_addr)
+            } else {
+                None
             };
-            let listener = TcpListener::bind(bind_addr)
-                .await
-                .anyerr()?
-                .into_std()
-                .anyerr()?;
-            let bound_addr = listener.local_addr().anyerr()?;
-            set_keepalive(&listener).anyerr()?;
-            let fut = axum_server::from_tcp(listener)?
-                .acceptor(acceptor)
-                .serve(app.into_make_service_with_connect_info::<SocketAddr>());
-            info!("HTTPS server listening on {bind_addr}");
-            tasks.spawn(fut);
-            Some(bound_addr)
-        } else {
-            None
-        };
 
-        Ok(HttpServer {
-            tasks,
-            http_addr,
-            https_addr,
-        })
+            // launch https
+            let https_addr = if let Some(config) = https_config {
+                let bind_addr = SocketAddr::new(
+                    config.bind_addr.unwrap_or(Ipv6Addr::UNSPECIFIED.into()),
+                    config.port,
+                );
+                let acceptor = {
+                    tokio::fs::create_dir_all(&cert_cache_dir)
+                        .await
+                        .with_std_context(|_| {
+                            format!(
+                                "failed to create cert cache dir at {}",
+                                cert_cache_dir.display()
+                            )
+                        })?;
+                    config
+                        .cert_mode
+                        .build(
+                            config.domains,
+                            cert_cache_dir,
+                            config.letsencrypt_contact,
+                            config.letsencrypt_prod.unwrap_or(false),
+                        )
+                        .await?
+                };
+                let listener = TcpListener::bind(bind_addr)
+                    .await
+                    .anyerr()?
+                    .into_std()
+                    .anyerr()?;
+                let bound_addr = listener.local_addr().anyerr()?;
+                set_keepalive(&listener).anyerr()?;
+                let handle = axum_server::Handle::new();
+                handles.push(handle.clone());
+                let fut = axum_server::from_tcp(listener)?
+                    .handle(handle)
+                    .acceptor(acceptor)
+                    .serve(app.into_make_service_with_connect_info::<SocketAddr>());
+                info!("HTTPS server listening on {bind_addr}");
+                tasks.spawn(fut);
+                Some(bound_addr)
+            } else {
+                None
+            };
+
+            Ok((http_addr, https_addr))
+        }
+        .await;
+        match startup {
+            Ok((http_addr, https_addr)) => Ok(HttpServer {
+                tasks,
+                handles,
+                http_addr,
+                https_addr,
+            }),
+            Err(error) => {
+                for handle in handles {
+                    handle.shutdown();
+                }
+                tasks.shutdown().await;
+                Err(error)
+            }
+        }
     }
 
     /// Get the bound address of the HTTP socket.
@@ -197,16 +218,27 @@ impl HttpServer {
 
     /// Shutdown the server and wait for all tasks to complete.
     pub(crate) async fn shutdown(mut self) -> Result<()> {
-        // TODO: Graceful cancellation.
+        // Notify native connection tasks too; aborting only the listener does not.
+        for handle in &self.handles {
+            handle.shutdown();
+        }
         self.tasks.abort_all();
-        self.run_until_done().await?;
+        self.drain_tasks().await?;
         Ok(())
     }
 
     /// Wait for all tasks to complete.
     ///
     /// Runs forever unless tasks fail.
-    pub(crate) async fn run_until_done(mut self) -> Result<()> {
+    pub(crate) async fn run_until_done(&mut self) -> Result<()> {
+        match self.tasks.join_next().await {
+            Some(Ok(Ok(()))) | None => Ok(()),
+            Some(Ok(Err(error))) => Err(anyerr!(error, "HTTP listener")),
+            Some(Err(error)) => Err(anyerr!(error, "HTTP listener join")),
+        }
+    }
+
+    async fn drain_tasks(&mut self) -> Result<()> {
         let mut final_res: Result<()> = Ok(());
         while let Some(res) = self.tasks.join_next().await {
             match res {
@@ -276,7 +308,9 @@ pub(crate) fn create_app(state: AppState, rate_limit_config: &RateLimitConfig) -
         .route("/dns-query", get(doh::get).post(doh::post))
         .route(
             "/pkarr/{key}",
-            if let Some(rate_limit) = rate_limit {
+            if state.backend.is_injected() {
+                get(pkarr::get)
+            } else if let Some(rate_limit) = rate_limit {
                 get(pkarr::get).put(pkarr::put.layer(rate_limit))
             } else {
                 get(pkarr::get).put(pkarr::put)
@@ -292,7 +326,30 @@ pub(crate) fn create_app(state: AppState, rate_limit_config: &RateLimitConfig) -
     router
         .layer(cors)
         .layer(trace)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            injected_no_store,
+        ))
         .route_layer(middleware::from_fn_with_state(state, metrics_middleware))
+}
+
+// Also covers HEAD/conditional requests and extractor failures; native handlers
+// still select status, body and content type. No HTTP cache bypasses admission.
+async fn injected_no_store(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> impl IntoResponse {
+    let no_store = state.backend.is_injected()
+        && (req.uri().path() == "/dns-query" || req.uri().path().starts_with("/pkarr/"));
+    let mut response = next.run(req).await;
+    if no_store {
+        response.headers_mut().insert(
+            http::header::CACHE_CONTROL,
+            http::HeaderValue::from_static("no-store"),
+        );
+    }
+    response
 }
 
 /// Record request metrics.
@@ -532,5 +589,43 @@ mod tests {
                 .set_certificate_verifier(Arc::new(NoCertificateVerification::default()));
             cfg
         }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use super::*;
+
+    struct DropWitness(Arc<AtomicBool>);
+    impl Drop for DropWitness {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    #[tokio::test]
+    async fn first_error_is_prompt_and_shutdown_destroys_sibling_task() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let witness = DropWitness(dropped.clone());
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            let _witness = witness;
+            std::future::pending::<std::io::Result<()>>().await
+        });
+        tasks.spawn(async { Err(std::io::Error::other("listener failed")) });
+        let mut server = HttpServer {
+            tasks,
+            handles: vec![],
+            http_addr: None,
+            https_addr: None,
+        };
+        assert!(server.run_until_done().await.is_err());
+        assert!(!dropped.load(Ordering::SeqCst));
+        server.shutdown().await.unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }

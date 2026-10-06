@@ -2,13 +2,13 @@
 
 use std::sync::Arc;
 
-use crate::{dns::DnsHandler, metrics::Metrics, store::ZoneStore};
+use crate::{dns::DnsHandler, lookup::Backend, metrics::Metrics};
 
 /// The shared app state.
 #[derive(Clone)]
 pub(crate) struct AppState {
     /// The pkarr DNS store
-    pub store: ZoneStore,
+    pub backend: Backend,
     /// Handler for DNS requests
     pub dns_handler: DnsHandler,
     /// Metrics collector.

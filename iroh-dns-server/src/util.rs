@@ -102,6 +102,22 @@ pub(crate) fn signed_packet_to_hickory_records_without_origin(
     signed_packet: &SignedPacket,
     filter: impl Fn(&Record) -> bool,
 ) -> Result<(Label, BTreeMap<RrKey, Arc<RecordSet>>), ProtoError> {
+    signed_packet_to_hickory_records(signed_packet, filter, |record| Some(record.ttl), false)
+}
+
+pub(crate) fn signed_packet_to_hickory_records_with_ttl(
+    signed_packet: &SignedPacket,
+    ttl: impl Fn(&Record) -> Option<u32>,
+) -> Result<(Label, BTreeMap<RrKey, Arc<RecordSet>>), ProtoError> {
+    signed_packet_to_hickory_records(signed_packet, |_| true, ttl, true)
+}
+
+fn signed_packet_to_hickory_records(
+    signed_packet: &SignedPacket,
+    filter: impl Fn(&Record) -> bool,
+    ttl: impl Fn(&Record) -> Option<u32>,
+    normalize: bool,
+) -> Result<(Label, BTreeMap<RrKey, Arc<RecordSet>>), ProtoError> {
     let common_zone = Label::from_utf8(&signed_packet.public_key().to_z32())?;
     let mut message = signed_packet_to_hickory_message(signed_packet)?;
     let answers = std::mem::take(&mut message.answers);
@@ -124,6 +140,10 @@ pub(crate) fn signed_packet_to_hickory_records_without_origin(
             continue;
         }
 
+        let Some(remaining_ttl) = ttl(&record) else {
+            continue;
+        };
+        record.ttl = remaining_ttl;
         let name_without_zone =
             Name::from_labels(name.iter().take(name.num_labels() as usize - 1))?;
         record.name = name_without_zone;
@@ -138,7 +158,12 @@ pub(crate) fn signed_packet_to_hickory_records_without_origin(
                 let set = e.get_mut();
                 let serial = set.serial();
                 // safe because we just created the arc and are sync iterating
-                Arc::get_mut(set).unwrap().insert(record, serial);
+                let set = Arc::get_mut(set).unwrap();
+                let minimum = set.ttl().min(record.ttl);
+                set.insert(record, serial);
+                if normalize {
+                    set.set_ttl(minimum);
+                }
             }
         }
     }

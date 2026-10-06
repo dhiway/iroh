@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::{net::SocketAddr, sync::Arc};
 
-use n0_error::Result;
+use n0_error::{Result, bail_any};
 use tracing::info;
 #[cfg(test)]
 use url::Url;
@@ -14,6 +14,7 @@ use crate::{
     config::Config,
     dns::{DnsHandler, DnsServer},
     http::HttpServer,
+    lookup::{Backend, PacketLookup},
     metrics::Metrics,
     state::AppState,
     store::ZoneStore,
@@ -30,6 +31,7 @@ pub struct Server {
     dns_server: DnsServer,
     metrics_server: Option<iroh_metrics::service::MetricsServer>,
     metrics: Arc<Metrics>,
+    backend: Backend,
 }
 
 impl Server {
@@ -52,6 +54,23 @@ impl Server {
         Self::bind_with_store(config, store, metrics).await
     }
 
+    /// Bind native listeners using a host-owned lookup for every dynamic request.
+    ///
+    /// No packet database, LRU or Mainline fallback is created. Mainline must be
+    /// disabled. The host owns authority/freshness policy; unavailable evidence
+    /// becomes SERVFAIL/503. Pkarr PUT is disabled. Static zones remain native.
+    pub async fn bind_with_lookup(config: Config, lookup: Arc<dyn PacketLookup>) -> Result<Self> {
+        if config.mainline_enabled().is_some() {
+            bail_any!("Mainline must be disabled with an injected packet lookup");
+        }
+        Self::bind_with_backend(
+            config,
+            Backend::injected(lookup),
+            Arc::new(Metrics::default()),
+        )
+        .await
+    }
+
     /// Spawn the server.
     ///
     /// This will spawn several background tasks:
@@ -63,11 +82,19 @@ impl Server {
         store: ZoneStore,
         metrics: Arc<Metrics>,
     ) -> Result<Self> {
+        Self::bind_with_backend(config, store.into(), metrics).await
+    }
+
+    async fn bind_with_backend(
+        config: Config,
+        backend: Backend,
+        metrics: Arc<Metrics>,
+    ) -> Result<Self> {
         let cert_cache_dir = config.data_dir()?.join("cert_cache");
-        let dns_handler = DnsHandler::new(store.clone(), &config.dns, metrics.clone())?;
+        let dns_handler = DnsHandler::new(backend.clone(), &config.dns, metrics.clone())?;
 
         let state = AppState {
-            store,
+            backend: backend.clone(),
             dns_handler,
             metrics: metrics.clone(),
         };
@@ -82,48 +109,73 @@ impl Server {
             None
         };
 
-        let http_server = HttpServer::spawn(
+        let http_server = match HttpServer::spawn(
             config.http,
             config.https,
             config.pkarr_put_rate_limit,
             state.clone(),
             cert_cache_dir,
         )
-        .await?;
-        let dns_server = DnsServer::spawn(config.dns, state.dns_handler.clone()).await?;
+        .await
+        {
+            Ok(server) => server,
+            Err(error) => {
+                backend.cancel();
+                if let Some(server) = metrics_server {
+                    server.shutdown().await;
+                }
+                backend.drain().await;
+                return Err(error);
+            }
+        };
+        let dns_server = match DnsServer::spawn(config.dns, state.dns_handler.clone()).await {
+            Ok(server) => server,
+            Err(error) => {
+                backend.cancel();
+                let _http_cleanup = http_server.shutdown().await;
+                if let Some(server) = metrics_server {
+                    server.shutdown().await;
+                }
+                backend.drain().await;
+                return Err(error);
+            }
+        };
 
         Ok(Self {
             http_server,
             dns_server,
             metrics_server,
             metrics,
+            backend,
         })
     }
 
-    /// Cancels the server tasks and waits for them to complete.
+    /// Cancels native tasks and awaits entered host lookup destruction.
+    ///
+    /// Retain and await this consuming future. Dropping it cannot promise an
+    /// asynchronous drain or destruction of every operating-system connection.
     pub async fn shutdown(mut self) -> Result<()> {
+        self.backend.cancel();
+        let (dns, http) = tokio::join!(self.dns_server.shutdown(), self.http_server.shutdown());
         if let Some(server) = self.metrics_server.take() {
             server.shutdown().await;
         }
-        let (res1, res2) = tokio::join!(self.dns_server.shutdown(), self.http_server.shutdown(),);
-        res1?;
-        res2?;
+        self.backend.drain().await;
+        dns?;
+        http?;
         Ok(())
     }
 
-    /// Waits for the server tasks to complete.
-    ///
-    /// Returns when a listener task finishes, either with success or an error.
+    /// Wait for the first native listener completion, then cancel and drain siblings.
+    /// Retain and await this future through cleanup, including after an error.
     pub async fn join(mut self) -> Result<()> {
-        tokio::select! {
-            res = self.dns_server.run_until_done() => res?,
-            res = self.http_server.run_until_done() => res?,
-        }
-        if let Some(server) = self.metrics_server.take() {
-            server.shutdown().await;
-        }
-
-        Ok(())
+        let result = tokio::select! {
+            res = self.dns_server.run_until_done() => res,
+            res = self.http_server.run_until_done() => res,
+        };
+        let cleanup = self.shutdown().await;
+        result?;
+        cleanup
     }
 
     /// Returns the [`Metrics`] for this server.
