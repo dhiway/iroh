@@ -25,3 +25,12 @@ including N0 defaults. Apply caller lookups, relays and crypto overrides afterwa
 Identity, ALPNs and IP binds remain intact. The preset contains no infrastructure
 addresses or chain client; host discovery wiring and qualification remain separate.
 Existing upstream presets are unchanged. Pure builder tests contact no network.
+
+T268.122 adds explicit `DnsAddressLookup::cmns_builder` and
+`PkarrResolver::cmns_builder` readers, plus `DnsResolver` Commons endpoint-ID
+lookup methods. They select only `_cmns` using existing native TXT/Pkarr parsers,
+DNS staggering, resolver inheritance and authenticated HTTP packet retrieval.
+Existing constructors still select `_iroh`; publishing is unchanged. Missing
+selected records retain native empty-data behavior, without fallback. These
+readers do not establish chain authority, packet freshness or host integration.
+Offline custom-resolver and loopback HTTP tests exercise the real resolve paths.

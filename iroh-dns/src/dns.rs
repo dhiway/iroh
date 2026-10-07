@@ -2,7 +2,8 @@
 //!
 //! The main export is the [`DnsResolver`] struct. It provides methods to resolve domain names
 //! to IPv4 and IPv6 addresses, and to look up TXT records. Additionally, the resolver features
-//! methods to resolve the [`EndpointInfo`] for an iroh [`EndpointId`] from `_iroh` TXT records.
+//! methods to resolve the [`EndpointInfo`] for an iroh [`EndpointId`] from `_iroh` TXT records,
+//! with explicit Commons methods selecting `_cmns` instead.
 //! See the [`crate::endpoint_info`] module documentation for details on how iroh endpoint records
 //! are structured.
 
@@ -1059,10 +1060,41 @@ impl DnsResolver {
         endpoint_id: &EndpointId,
         origin: &str,
     ) -> Result<EndpointInfo, LookupError> {
-        let name = format!("_iroh.{}.{}", endpoint_id.to_z32(), origin);
+        self.lookup_endpoint_by_id_inner(endpoint_id, origin, false)
+            .await
+    }
+
+    /// Looks up only Commons `_cmns` endpoint records using the native TXT resolver.
+    ///
+    /// No `_iroh` fallback is performed. TXT results have the same trust limits and
+    /// empty-data semantics as [`Self::lookup_endpoint_by_id`]; they confer no chain authority.
+    pub async fn lookup_cmns_endpoint_by_id(
+        &self,
+        endpoint_id: &EndpointId,
+        origin: &str,
+    ) -> Result<EndpointInfo, LookupError> {
+        self.lookup_endpoint_by_id_inner(endpoint_id, origin, true)
+            .await
+    }
+
+    async fn lookup_endpoint_by_id_inner(
+        &self,
+        endpoint_id: &EndpointId,
+        origin: &str,
+        commons: bool,
+    ) -> Result<EndpointInfo, LookupError> {
+        let label = if commons {
+            crate::CMNS_TXT_NAME
+        } else {
+            crate::IROH_TXT_NAME
+        };
+        let name = format!("{label}.{}.{}", endpoint_id.to_z32(), origin);
         let lookup = self.lookup_txt(name.clone(), DNS_TIMEOUT).await?;
-        let info = EndpointInfo::from_txt_lookup(name, lookup)?;
-        Ok(info)
+        Ok(if commons {
+            EndpointInfo::from_cmns_txt_lookup(name, lookup)?
+        } else {
+            EndpointInfo::from_txt_lookup(name, lookup)?
+        })
     }
 
     /// Looks up endpoint info by DNS name.
@@ -1108,6 +1140,19 @@ impl DnsResolver {
         delays_ms: &[u64],
     ) -> Result<EndpointInfo, StaggeredError<LookupError>> {
         let f = || self.lookup_endpoint_by_id(endpoint_id, origin);
+        stagger_call(f, delays_ms).await
+    }
+
+    /// Looks up only Commons `_cmns` endpoint records with native staggered calls.
+    ///
+    /// Scheduling, timeouts and error aggregation match [`Self::lookup_endpoint_by_id_staggered`].
+    pub async fn lookup_cmns_endpoint_by_id_staggered(
+        &self,
+        endpoint_id: &EndpointId,
+        origin: &str,
+        delays_ms: &[u64],
+    ) -> Result<EndpointInfo, StaggeredError<LookupError>> {
+        let f = || self.lookup_cmns_endpoint_by_id(endpoint_id, origin);
         stagger_call(f, delays_ms).await
     }
 }
@@ -1412,5 +1457,100 @@ pub(crate) mod tests {
             .lookup_ipv4("bar.example", Duration::from_secs(1))
             .await;
         assert!(matches!(res, Err(DnsError::NoResponse { .. })))
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct CmnsResolver(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl Resolver for CmnsResolver {
+        fn lookup_ipv4(&self, _: String) -> BoxFuture<Result<BoxIter<Ipv4Addr>, DnsError>> {
+            Box::pin(async { panic!("unexpected IPv4 query") })
+        }
+        fn lookup_ipv6(&self, _: String) -> BoxFuture<Result<BoxIter<Ipv6Addr>, DnsError>> {
+            Box::pin(async { panic!("unexpected IPv6 query") })
+        }
+        fn lookup_txt(&self, host: String) -> BoxFuture<Result<BoxIter<TxtRecordData>, DnsError>> {
+            self.0.lock().unwrap().push(host.clone());
+            Box::pin(async move {
+                if host.ends_with("error.example") {
+                    return Err(e!(DnsError::NoResponse));
+                }
+                let value = if host.starts_with("_cmns.") {
+                    "addr=127.0.0.1:2002"
+                } else {
+                    "addr=127.0.0.1:1001"
+                };
+                let record: TxtRecordData = [value.as_bytes().to_vec().into_boxed_slice()]
+                    .into_iter()
+                    .collect();
+                Ok(Box::new([record].into_iter()) as BoxIter<TxtRecordData>)
+            })
+        }
+        fn clear_cache(&self) {}
+        fn reset(&self) -> Box<dyn Resolver> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn cmns_endpoint_lookup_uses_selected_name_and_native_staggering() {
+        let native = CmnsResolver::default();
+        let resolver = DnsResolver::custom(native.clone());
+        let id = iroh_base::SecretKey::from_bytes(&[11; 32]).public();
+        let old = resolver
+            .lookup_endpoint_by_id(&id, "custom.example")
+            .await
+            .unwrap();
+        let cmns = resolver
+            .lookup_cmns_endpoint_by_id(&id, "custom.example")
+            .await
+            .unwrap();
+        assert_eq!(
+            old.addrs().cloned().collect::<Vec<_>>(),
+            vec![iroh_base::TransportAddr::Ip(
+                "127.0.0.1:1001".parse().unwrap()
+            )]
+        );
+        assert_eq!(
+            cmns.addrs().cloned().collect::<Vec<_>>(),
+            vec![iroh_base::TransportAddr::Ip(
+                "127.0.0.1:2002".parse().unwrap()
+            )]
+        );
+        let staggered = resolver
+            .lookup_cmns_endpoint_by_id_staggered(&id, "custom.example", &[1000])
+            .await
+            .unwrap();
+        assert_eq!(staggered, cmns);
+        assert_eq!(
+            *native.0.lock().unwrap(),
+            vec![
+                format!("_iroh.{}.custom.example", id.to_z32()),
+                format!("_cmns.{}.custom.example", id.to_z32()),
+                format!("_cmns.{}.custom.example", id.to_z32())
+            ]
+        );
+        assert!(
+            resolver
+                .lookup_cmns_endpoint_by_id(&id, "error.example")
+                .await
+                .is_err()
+        );
+        assert!(
+            resolver
+                .lookup_cmns_endpoint_by_id_staggered(&id, "error.example", &[10])
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            native
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|name| name.ends_with("error.example"))
+                .count(),
+            3
+        );
     }
 }

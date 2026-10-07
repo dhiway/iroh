@@ -441,6 +441,7 @@ impl PublisherService {
 #[derive(Debug)]
 pub struct PkarrResolverBuilder {
     pkarr_relay: Url,
+    commons: bool,
     #[cfg(not(wasm_browser))]
     dns_resolver: Option<DnsResolver>,
 }
@@ -465,7 +466,10 @@ impl PkarrResolverBuilder {
             self.dns_resolver.unwrap_or_default(),
         );
 
-        PkarrResolver { pkarr_client }
+        PkarrResolver {
+            pkarr_client,
+            commons: self.commons,
+        }
     }
 }
 
@@ -498,6 +502,7 @@ impl AddressLookupBuilder for PkarrResolverBuilder {
 #[derive(derive_more::Debug, Clone)]
 pub struct PkarrResolver {
     pkarr_client: PkarrRelayClient,
+    commons: bool,
 }
 
 impl PkarrResolver {
@@ -507,8 +512,20 @@ impl PkarrResolver {
     pub fn builder(pkarr_relay: Url) -> PkarrResolverBuilder {
         PkarrResolverBuilder {
             pkarr_relay,
+            commons: false,
             #[cfg(not(wasm_browser))]
             dns_resolver: None,
+        }
+    }
+
+    /// Creates a builder that reads only Commons `_cmns` records from this relay.
+    ///
+    /// Native HTTP, TLS and requested-key signature verification are unchanged.
+    /// There is no `_iroh` fallback or additional chain authority/freshness check.
+    pub fn cmns_builder(pkarr_relay: Url) -> PkarrResolverBuilder {
+        PkarrResolverBuilder {
+            commons: true,
+            ..Self::builder(pkarr_relay)
         }
     }
 
@@ -539,10 +556,15 @@ impl AddressLookup for PkarrResolver {
         endpoint_id: EndpointId,
     ) -> Option<BoxStream<Result<AddressLookupItem, AddressLookupError>>> {
         let pkarr_client = self.pkarr_client.clone();
+        let commons = self.commons;
         let fut = async move {
             let signed_packet = pkarr_client.resolve(endpoint_id).await?;
-            let info = EndpointInfo::from_pkarr_signed_packet(&signed_packet)
-                .map_err(|err| AddressLookupError::from_err_any("pkarr", err))?;
+            let info = if commons {
+                EndpointInfo::from_cmns_pkarr_signed_packet(&signed_packet)
+            } else {
+                EndpointInfo::from_pkarr_signed_packet(&signed_packet)
+            }
+            .map_err(|err| AddressLookupError::from_err_any("pkarr", err))?;
             let item = AddressLookupItem::new(info, "pkarr", None);
             Ok(item)
         };
@@ -679,5 +701,243 @@ impl PkarrRelayClient {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(all(test, not(wasm_browser), with_crypto_provider))]
+mod cmns_lookup_tests {
+    use std::{
+        net::{Ipv4Addr, Ipv6Addr},
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use axum::{Router, routing::get};
+    use iroh_dns::dns::{BoxIter, DnsError, Resolver, TxtRecordData};
+    use n0_future::{StreamExt, boxed::BoxFuture};
+    use simple_dns::{CLASS, Name, Packet, ResourceRecord, rdata::RData};
+
+    use super::*;
+
+    #[derive(Clone, Debug, Default)]
+    struct LoopbackResolver(Arc<AtomicUsize>);
+    impl Resolver for LoopbackResolver {
+        fn lookup_ipv4(&self, host: String) -> BoxFuture<Result<BoxIter<Ipv4Addr>, DnsError>> {
+            assert_eq!(host, "localhost");
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(Box::new([Ipv4Addr::LOCALHOST].into_iter()) as BoxIter<Ipv4Addr>) })
+        }
+        fn lookup_ipv6(&self, host: String) -> BoxFuture<Result<BoxIter<Ipv6Addr>, DnsError>> {
+            assert_eq!(host, "localhost");
+            Box::pin(async { Ok(Box::new(std::iter::empty()) as BoxIter<Ipv6Addr>) })
+        }
+        fn lookup_txt(&self, _: String) -> BoxFuture<Result<BoxIter<TxtRecordData>, DnsError>> {
+            Box::pin(async { panic!("unexpected TXT lookup") })
+        }
+        fn clear_cache(&self) {}
+        fn reset(&self) -> Box<dyn Resolver> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn signed_packet(key: &SecretKey, records: &[(&str, &str)]) -> SignedPacket {
+        let mut packet = Packet::new_reply(0);
+        for (label, value) in records {
+            packet.answers.push(ResourceRecord::new(
+                Name::new(&format!("{label}.{}", key.public().to_z32()))
+                    .unwrap()
+                    .into_owned(),
+                CLASS::IN,
+                30,
+                RData::TXT((*value).try_into().unwrap()),
+            ));
+        }
+        let encoded = packet.build_bytes_vec_compressed().unwrap();
+        let timestamp = iroh_dns::pkarr::Timestamp::from_micros(1_720_000_000_000_000);
+        let mut signable =
+            format!("3:seqi{}e1:v{}:", timestamp.as_micros(), encoded.len()).into_bytes();
+        signable.extend_from_slice(&encoded);
+        let packet = SignedPacket::from_parts_unchecked(
+            key.public().as_bytes(),
+            &key.sign(&signable).to_bytes(),
+            timestamp,
+            &encoded,
+        )
+        .unwrap();
+        SignedPacket::from_bytes(packet.as_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn cmns_pkarr_resolve_preserves_authentication_and_namespace_results() {
+        let key = SecretKey::from_bytes(&[9; 32]);
+        let mixed = signed_packet(
+            &key,
+            &[
+                ("_iroh", "addr=127.0.0.1:1001"),
+                ("_cmns", "addr=127.0.0.1:2002"),
+            ],
+        );
+        let old_only = signed_packet(&key, &[("_iroh", "addr=127.0.0.1:1001")]);
+        let bad_old = signed_packet(
+            &key,
+            &[("_iroh", "unknown=value"), ("_cmns", "addr=127.0.0.1:2002")],
+        );
+        let bad_cmns = signed_packet(
+            &key,
+            &[("_iroh", "addr=127.0.0.1:1001"), ("_cmns", "unknown=value")],
+        );
+        let invalid = signed_packet(&key, &[("_cmns", "addr=invalid")]);
+        let mut tampered = mixed.to_relay_payload().to_vec();
+        *tampered.last_mut().unwrap() ^= 1;
+        let mut app = Router::new();
+        for (name, payload) in [
+            ("mixed", mixed.to_relay_payload().to_vec()),
+            ("old-only", old_only.to_relay_payload().to_vec()),
+            ("bad-old", bad_old.to_relay_payload().to_vec()),
+            ("bad-cmns", bad_cmns.to_relay_payload().to_vec()),
+            ("invalid", invalid.to_relay_payload().to_vec()),
+            ("tampered", tampered),
+        ] {
+            // Serve the original native payload; the real client must verify it.
+            app = app.route(
+                &format!("/{name}/{{key}}"),
+                get(move || {
+                    let payload = payload.clone();
+                    async move { payload }
+                }),
+            );
+        }
+        app = app.route(
+            "/failure/{key}",
+            get(|| async { http::StatusCode::SERVICE_UNAVAILABLE }),
+        );
+        let inherited = LoopbackResolver::default();
+        let endpoint = Endpoint::builder(crate::endpoint::presets::dw())
+            .dns_resolver(DnsResolver::custom(inherited.clone()))
+            .portmapper_config(crate::endpoint::PortmapperConfig::Disabled)
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let test_endpoint = endpoint.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let mut server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+        });
+        let mut body = tokio::spawn(async move {
+            #[cfg(feature = "tls-ring")]
+            let provider = rustls::crypto::ring::default_provider();
+            #[cfg(all(feature = "tls-aws-lc-rs", not(feature = "tls-ring")))]
+            let provider = rustls::crypto::aws_lc_rs::default_provider();
+            let tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth();
+            for (route, commons, expected) in [
+                ("mixed", false, Some(Some(1001))),
+                ("mixed", true, Some(Some(2002))),
+                ("old-only", true, Some(None)),
+                ("bad-old", true, Some(Some(2002))),
+                ("bad-cmns", false, Some(Some(1001))),
+                ("bad-cmns", true, None),
+                ("invalid", true, Some(None)),
+                ("tampered", true, None),
+                ("failure", true, None),
+            ] {
+                let url = format!("http://{addr}/{route}").parse().unwrap();
+                let builder = if commons {
+                    PkarrResolver::cmns_builder(url)
+                } else {
+                    PkarrResolver::builder(url)
+                };
+                let lookup = builder.build(tls.clone());
+                let mut stream = lookup.resolve(key.public()).unwrap();
+                let item = stream.next().await.unwrap();
+                match expected {
+                    Some(port) => {
+                        let item = item.unwrap();
+                        assert_eq!(item.endpoint_id(), key.public());
+                        let expected: Vec<_> = port
+                            .into_iter()
+                            .map(|port| {
+                                iroh_base::TransportAddr::Ip(
+                                    format!("127.0.0.1:{port}").parse().unwrap(),
+                                )
+                            })
+                            .collect();
+                        assert_eq!(
+                            item.endpoint_info().addrs().cloned().collect::<Vec<_>>(),
+                            expected
+                        );
+                        assert_eq!(item.provenance(), "pkarr");
+                    }
+                    None => assert!(item.is_err(), "{route}"),
+                }
+                assert!(stream.next().await.is_none());
+            }
+            let local_url: Url = format!("http://localhost:{}/mixed", addr.port())
+                .parse()
+                .unwrap();
+            let lookup = PkarrResolver::cmns_builder(local_url.clone())
+                .into_address_lookup(&test_endpoint)
+                .unwrap();
+            assert!(
+                lookup
+                    .resolve(key.public())
+                    .unwrap()
+                    .next()
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            let inherited_count = inherited.0.load(Ordering::SeqCst);
+            assert!(inherited_count > 0);
+            let explicit = LoopbackResolver::default();
+            let lookup = PkarrResolver::cmns_builder(local_url)
+                .dns_resolver(DnsResolver::custom(explicit.clone()))
+                .into_address_lookup(&test_endpoint)
+                .unwrap();
+            assert!(
+                lookup
+                    .resolve(key.public())
+                    .unwrap()
+                    .next()
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            assert!(explicit.0.load(Ordering::SeqCst) > 0);
+            assert_eq!(inherited.0.load(Ordering::SeqCst), inherited_count);
+            let lookup =
+                PkarrResolver::cmns_builder(format!("http://{addr}/mixed").parse().unwrap())
+                    .build(tls);
+            let wrong_id = SecretKey::from_bytes(&[10; 32]).public();
+            let mut stream = lookup.resolve(wrong_id).unwrap();
+            assert!(stream.next().await.unwrap().is_err());
+            assert!(stream.next().await.is_none());
+        });
+        let result = tokio::time::timeout(Duration::from_secs(10), &mut body).await;
+        if result.is_err() {
+            body.abort();
+            let _ = body.await;
+        }
+        let _ = stop.send(());
+        // Always stop and join owned tasks before propagating a panic or timeout.
+        let server_result = tokio::time::timeout(Duration::from_secs(5), &mut server).await;
+        if server_result.is_err() {
+            server.abort();
+            let _ = server.await;
+        }
+        endpoint.close().await;
+        server_result.unwrap().unwrap().unwrap();
+        result.unwrap().unwrap();
     }
 }
