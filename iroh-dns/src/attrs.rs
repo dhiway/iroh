@@ -19,6 +19,9 @@ use crate::pkarr;
 /// The DNS name for the iroh TXT record.
 pub const IROH_TXT_NAME: &str = "_iroh";
 
+/// The explicitly selected DNS name for Commons endpoint TXT records.
+pub const CMNS_TXT_NAME: &str = "_cmns";
+
 #[allow(missing_docs)]
 #[stack_error(derive, add_meta)]
 #[non_exhaustive]
@@ -47,23 +50,31 @@ pub enum ParseError {
     },
     #[error("Record is not an `iroh` record, expected `_iroh`, got `{label}`")]
     NotAnIrohRecord { label: String },
+    #[error("Unexpected endpoint record name, expected `{expected}`, got `{label}`")]
+    UnexpectedRecordName { expected: String, label: String },
     #[error(transparent)]
     DecodingError { source: iroh_base::KeyParsingError },
 }
 
 /// Parses a [`EndpointId`] from iroh DNS name.
 ///
-/// Takes a DNS name and expects the first label to be [`IROH_TXT_NAME`] and the second
+/// Takes a DNS name and expects the first label to be `record_name` and the second
 /// label to be a z32 encoded [`EndpointId`]. Ignores subsequent labels.
-fn endpoint_id_from_txt_name(name: &str) -> Result<EndpointId, ParseError> {
+fn endpoint_id_from_txt_name(name: &str, record_name: &str) -> Result<EndpointId, ParseError> {
     let num_labels = name.split(".").count();
     if num_labels < 2 {
         return Err(e!(ParseError::NumLabels { num_labels }));
     }
     let mut labels = name.split(".");
     let label = labels.next().expect("checked above");
-    if label != IROH_TXT_NAME {
-        return Err(e!(ParseError::NotAnIrohRecord {
+    if label != record_name {
+        if record_name == IROH_TXT_NAME {
+            return Err(e!(ParseError::NotAnIrohRecord {
+                label: label.to_string()
+            }));
+        }
+        return Err(e!(ParseError::UnexpectedRecordName {
+            expected: record_name.to_string(),
             label: label.to_string()
         }));
     }
@@ -150,8 +161,9 @@ impl<T: FromStr + Display + Hash + Ord> TxtAttrs<T> {
     pub(crate) fn from_txt_lookup(
         name: String,
         lookup: impl Iterator<Item = impl Display>,
+        record_name: &str,
     ) -> Result<Self, ParseError> {
-        let queried_endpoint_id = endpoint_id_from_txt_name(&name)?;
+        let queried_endpoint_id = endpoint_id_from_txt_name(&name, record_name)?;
         let strings = lookup.map(|record| record.to_string());
         Self::from_strings(queried_endpoint_id, strings)
     }
@@ -159,10 +171,11 @@ impl<T: FromStr + Display + Hash + Ord> TxtAttrs<T> {
     /// Parses a [`pkarr::SignedPacket`].
     pub(crate) fn from_pkarr_signed_packet(
         packet: &pkarr::SignedPacket,
+        record_name: &str,
     ) -> Result<Self, ParseError> {
         let pubkey = packet.public_key();
         let endpoint_id = EndpointId::from_bytes(pubkey.as_bytes()).expect("valid key");
-        let txt_strs = packet.txt_records(IROH_TXT_NAME);
+        let txt_strs = packet.txt_records(record_name);
         Self::from_strings(endpoint_id, txt_strs.into_iter())
     }
 
@@ -180,10 +193,11 @@ impl<T: FromStr + Display + Hash + Ord> TxtAttrs<T> {
         &self,
         secret_key: &SecretKey,
         ttl: u32,
+        record_name: &str,
     ) -> Result<pkarr::SignedPacket, EncodingError> {
         let signed_packet = pkarr::SignedPacket::from_txt_strings(
             secret_key,
-            IROH_TXT_NAME,
+            record_name,
             self.to_txt_strings(),
             ttl,
         )

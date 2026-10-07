@@ -55,7 +55,7 @@ use n0_error::{ensure, stack_error};
 use url::Url;
 
 use crate::{
-    attrs::{EncodingError, IrohAttr, ParseError, TxtAttrs},
+    attrs::{CMNS_TXT_NAME, EncodingError, IROH_TXT_NAME, IrohAttr, ParseError, TxtAttrs},
     pkarr,
 };
 
@@ -455,13 +455,14 @@ impl EndpointInfo {
         domain_name: String,
         lookup: impl Iterator<Item = impl Display>,
     ) -> Result<Self, ParseError> {
-        let attrs: TxtAttrs<IrohAttr> = TxtAttrs::from_txt_lookup(domain_name, lookup)?;
+        let attrs: TxtAttrs<IrohAttr> =
+            TxtAttrs::from_txt_lookup(domain_name, lookup, IROH_TXT_NAME)?;
         Ok(endpoint_info_from_attrs(&attrs))
     }
 
     /// Parses a [`EndpointInfo`] from a [`pkarr::SignedPacket`].
     pub fn from_pkarr_signed_packet(packet: &pkarr::SignedPacket) -> Result<Self, ParseError> {
-        let attrs: TxtAttrs<IrohAttr> = TxtAttrs::from_pkarr_signed_packet(packet)?;
+        let attrs: TxtAttrs<IrohAttr> = TxtAttrs::from_pkarr_signed_packet(packet, IROH_TXT_NAME)?;
         Ok(endpoint_info_from_attrs(&attrs))
     }
 
@@ -473,7 +474,50 @@ impl EndpointInfo {
         secret_key: &SecretKey,
         ttl: u32,
     ) -> Result<pkarr::SignedPacket, EncodingError> {
-        self.to_attrs().to_pkarr_signed_packet(secret_key, ttl)
+        self.to_attrs()
+            .to_pkarr_signed_packet(secret_key, ttl, IROH_TXT_NAME)
+    }
+
+    /// Parses only Commons `_cmns.<z32-endpoint-id>.<origin>` TXT lookup results.
+    ///
+    /// This has the same trust and attribute-parsing behavior as [`Self::from_txt_lookup`].
+    /// A different record label is rejected; there is no `_iroh` fallback.
+    pub fn from_cmns_txt_lookup(
+        domain_name: String,
+        lookup: impl Iterator<Item = impl Display>,
+    ) -> Result<Self, ParseError> {
+        let attrs: TxtAttrs<IrohAttr> =
+            TxtAttrs::from_txt_lookup(domain_name, lookup, CMNS_TXT_NAME)?;
+        Ok(endpoint_info_from_attrs(&attrs))
+    }
+
+    /// Parses only the `_cmns` records under a native packet's signer zone.
+    ///
+    /// No matching records yields empty endpoint data, just as for the native `_iroh`
+    /// parser. Invalid address values are discarded. Callers decide whether the result
+    /// is usable and own chain authority, freshness and replay policy.
+    ///
+    /// This method does not verify the packet signature. For untrusted bytes, use
+    /// [`pkarr::SignedPacket::from_bytes`] first; unchecked packet constructors do not
+    /// establish authenticity. Parsing leaves the signed packet unchanged.
+    pub fn from_cmns_pkarr_signed_packet(packet: &pkarr::SignedPacket) -> Result<Self, ParseError> {
+        let attrs: TxtAttrs<IrohAttr> = TxtAttrs::from_pkarr_signed_packet(packet, CMNS_TXT_NAME)?;
+        Ok(endpoint_info_from_attrs(&attrs))
+    }
+
+    /// Creates a new native signed packet containing only `_cmns` endpoint records.
+    ///
+    /// Encoding uses the supplied key's identity and a fresh native timestamp, with
+    /// the supplied TTL. As in [`Self::to_pkarr_signed_packet`], `self.endpoint_id` is
+    /// not checked against that key. This is not byte-preserving packet forwarding;
+    /// forward original packet bytes when preserving an existing signature and age.
+    pub fn to_cmns_pkarr_signed_packet(
+        &self,
+        secret_key: &SecretKey,
+        ttl: u32,
+    ) -> Result<pkarr::SignedPacket, EncodingError> {
+        self.to_attrs()
+            .to_pkarr_signed_packet(secret_key, ttl, CMNS_TXT_NAME)
     }
 
     /// Converts into a list of `{key}={value}` strings.
@@ -656,5 +700,217 @@ mod tests {
         assert_eq!(endpoint_info, expected_endpoint_info);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cmns_tests {
+    use iroh_base::{CustomAddr, SecretKey, TransportAddr};
+    use simple_dns::{CLASS, Name, Packet, ResourceRecord, rdata::RData};
+
+    use super::{EndpointData, EndpointInfo};
+    use crate::{
+        CMNS_TXT_NAME, IROH_TXT_NAME,
+        pkarr::{SignedPacket, Timestamp},
+    };
+
+    fn mixed_packet(key: &SecretKey, records: &[(String, &str)]) -> SignedPacket {
+        let mut packet = Packet::new_reply(0);
+        for (name, value) in records {
+            packet.answers.push(ResourceRecord::new(
+                Name::new(name).unwrap().into_owned(),
+                CLASS::IN,
+                30,
+                RData::TXT((*value).try_into().unwrap()),
+            ));
+        }
+        let encoded = packet.build_bytes_vec_compressed().unwrap();
+        let timestamp = Timestamp::from_micros(1_720_000_000_000_000);
+        let mut signable =
+            format!("3:seqi{}e1:v{}:", timestamp.as_micros(), encoded.len()).into_bytes();
+        signable.extend_from_slice(&encoded);
+        let packet = SignedPacket::from_parts_unchecked(
+            key.public().as_bytes(),
+            &key.sign(&signable).to_bytes(),
+            timestamp,
+            &encoded,
+        )
+        .unwrap();
+        SignedPacket::from_bytes(packet.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn cmns_roundtrip_preserves_native_data_and_packet_verification() {
+        let key = SecretKey::from_bytes(&[1; 32]);
+        let data = EndpointData::from_iter([
+            TransportAddr::Relay("https://relay.example.com".parse().unwrap()),
+            TransportAddr::Ip("127.0.0.1:1234".parse().unwrap()),
+            TransportAddr::Custom(CustomAddr::from_parts(42, &[3; 16])),
+        ])
+        .with_user_data("commons endpoint".parse().unwrap());
+        let expected = EndpointInfo::from_parts(key.public(), data);
+        let packet = expected.to_cmns_pkarr_signed_packet(&key, 47).unwrap();
+        let bytes = packet.as_bytes().to_vec();
+        let timestamp = packet.timestamp();
+        let verified = SignedPacket::from_bytes(&bytes).unwrap();
+        assert_eq!(
+            EndpointInfo::from_cmns_pkarr_signed_packet(&verified).unwrap(),
+            expected
+        );
+        assert_eq!(verified.public_key(), key.public());
+        assert_eq!(verified.timestamp(), timestamp);
+        assert_eq!(verified.as_bytes(), bytes);
+        let native = Packet::parse(verified.encoded_packet()).unwrap();
+        assert!(!native.answers.is_empty());
+        assert!(native.answers.iter().all(|record| record.ttl == 47
+            && record.name.to_string() == format!("_cmns.{}", key.public().to_z32())));
+        assert!(
+            !EndpointInfo::from_pkarr_signed_packet(&verified)
+                .unwrap()
+                .data
+                .has_addrs()
+        );
+        let old = expected.to_pkarr_signed_packet(&key, 47).unwrap();
+        assert_eq!(
+            old.txt_records(IROH_TXT_NAME),
+            verified.txt_records(CMNS_TXT_NAME)
+        );
+        assert_eq!(
+            EndpointInfo::from_pkarr_signed_packet(&old).unwrap(),
+            expected
+        );
+        assert!(
+            !EndpointInfo::from_cmns_pkarr_signed_packet(&old)
+                .unwrap()
+                .data
+                .has_addrs()
+        );
+        let mut tampered = bytes;
+        tampered[104] ^= 1;
+        assert!(SignedPacket::from_bytes(&tampered).is_err());
+    }
+
+    #[test]
+    fn mixed_namespaces_are_selected_before_attribute_parsing() {
+        let key = SecretKey::from_bytes(&[1; 32]);
+        let origin = key.public().to_z32();
+        let foreign = SecretKey::from_bytes(&[2; 32]).public().to_z32();
+        let packet = mixed_packet(
+            &key,
+            &[
+                (format!("_iroh.{origin}"), "addr=127.0.0.1:1001"),
+                (format!("_cmns.{origin}"), "addr=127.0.0.1:1002"),
+                (format!("_cmns-other.{origin}"), "malformed"),
+                (format!("_cmns.child.{origin}"), "malformed"),
+                (format!("_cmns.{foreign}"), "malformed"),
+            ],
+        );
+        let before = packet.as_bytes().to_vec();
+        assert_eq!(
+            EndpointInfo::from_pkarr_signed_packet(&packet)
+                .unwrap()
+                .ip_addrs()
+                .collect::<Vec<_>>(),
+            vec!["127.0.0.1:1001".parse().unwrap()]
+        );
+        assert_eq!(
+            EndpointInfo::from_cmns_pkarr_signed_packet(&packet)
+                .unwrap()
+                .ip_addrs()
+                .collect::<Vec<_>>(),
+            vec!["127.0.0.1:1002".parse().unwrap()]
+        );
+        assert_eq!(packet.as_bytes(), before);
+        for (valid, invalid) in [
+            (IROH_TXT_NAME, CMNS_TXT_NAME),
+            (CMNS_TXT_NAME, IROH_TXT_NAME),
+        ] {
+            let packet = mixed_packet(
+                &key,
+                &[
+                    (format!("{valid}.{origin}"), "addr=127.0.0.1:1003"),
+                    (format!("{invalid}.{origin}"), "malformed"),
+                ],
+            );
+            let (selected, other) = if valid == IROH_TXT_NAME {
+                (
+                    EndpointInfo::from_pkarr_signed_packet(&packet),
+                    EndpointInfo::from_cmns_pkarr_signed_packet(&packet),
+                )
+            } else {
+                (
+                    EndpointInfo::from_cmns_pkarr_signed_packet(&packet),
+                    EndpointInfo::from_pkarr_signed_packet(&packet),
+                )
+            };
+            assert_eq!(
+                selected.unwrap().ip_addrs().collect::<Vec<_>>(),
+                vec!["127.0.0.1:1003".parse().unwrap()]
+            );
+            assert!(other.is_err());
+        }
+    }
+
+    #[test]
+    fn both_namespaces_keep_native_missing_malformed_and_txt_label_behavior() {
+        let key = SecretKey::from_bytes(&[1; 32]);
+        for label in [IROH_TXT_NAME, CMNS_TXT_NAME] {
+            let parse = |packet: &SignedPacket| {
+                if label == IROH_TXT_NAME {
+                    EndpointInfo::from_pkarr_signed_packet(packet)
+                } else {
+                    EndpointInfo::from_cmns_pkarr_signed_packet(packet)
+                }
+            };
+            for value in ["malformed", "unknown=value"] {
+                let packet = SignedPacket::from_txt_strings(&key, label, [value], 30).unwrap();
+                assert!(parse(&packet).is_err());
+            }
+            let invalid_addr =
+                SignedPacket::from_txt_strings(&key, label, ["addr=invalid"], 30).unwrap();
+            assert!(!parse(&invalid_addr).unwrap().data.has_addrs());
+            let absent = SignedPacket::from_txt_strings(&key, "_other", ["malformed"], 30).unwrap();
+            assert_eq!(parse(&absent).unwrap(), EndpointInfo::new(key.public()));
+            for actual_label in [IROH_TXT_NAME, CMNS_TXT_NAME, "_cmns-other"] {
+                let name = format!("{actual_label}.{}.example.com", key.public().to_z32());
+                let records = ["addr=127.0.0.1:2001"].into_iter();
+                let result = if label == IROH_TXT_NAME {
+                    EndpointInfo::from_txt_lookup(name, records)
+                } else {
+                    EndpointInfo::from_cmns_txt_lookup(name, records)
+                };
+                if actual_label == label {
+                    assert_eq!(
+                        result.unwrap().ip_addrs().collect::<Vec<_>>(),
+                        vec!["127.0.0.1:2001".parse().unwrap()]
+                    );
+                } else {
+                    let error = result.unwrap_err();
+                    if label == IROH_TXT_NAME {
+                        assert!(
+                            error
+                                .to_string()
+                                .contains("Record is not an `iroh` record, expected `_iroh`")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encoding_keeps_native_signer_identity_behavior() {
+        let key = SecretKey::from_bytes(&[1; 32]);
+        let other = SecretKey::from_bytes(&[2; 32]);
+        let info = EndpointInfo::new(other.public())
+            .with_ip_addrs(vec!["127.0.0.1:3001".parse().unwrap()]);
+        let old = info.to_pkarr_signed_packet(&key, 30).unwrap();
+        let cmns = info.to_cmns_pkarr_signed_packet(&key, 30).unwrap();
+        let old = EndpointInfo::from_pkarr_signed_packet(&old).unwrap();
+        let cmns = EndpointInfo::from_cmns_pkarr_signed_packet(&cmns).unwrap();
+        assert_eq!(cmns, old);
+        assert_eq!(cmns.endpoint_id, key.public());
+        assert_ne!(cmns.endpoint_id, info.endpoint_id);
+        assert_eq!(cmns.data, info.data);
     }
 }
