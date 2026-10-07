@@ -18,3 +18,10 @@ TTL. Retain original bytes when forwarding an existing signed packet.
 
 These primitives do not supply chain authority, network scope, replay storage,
 publication policy, a Commons preset, host wiring or qualification evidence.
+
+T268.111 adds `iroh::endpoint::presets::dw()` using native preset hooks. It
+selects Minimal's crypto provider and clears prior lookup and relay configuration,
+including N0 defaults. Apply caller lookups, relays and crypto overrides afterward.
+Identity, ALPNs and IP binds remain intact. The preset contains no infrastructure
+addresses or chain client; host discovery wiring and qualification remain separate.
+Existing upstream presets are unchanged. Pure builder tests contact no network.
