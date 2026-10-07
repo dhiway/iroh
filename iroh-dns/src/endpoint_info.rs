@@ -812,6 +812,7 @@ mod cmns_tests {
             EndpointInfo::from_pkarr_signed_packet(&packet)
                 .unwrap()
                 .ip_addrs()
+                .copied()
                 .collect::<Vec<_>>(),
             vec!["127.0.0.1:1001".parse::<SocketAddr>().unwrap()]
         );
@@ -819,6 +820,7 @@ mod cmns_tests {
             EndpointInfo::from_cmns_pkarr_signed_packet(&packet)
                 .unwrap()
                 .ip_addrs()
+                .copied()
                 .collect::<Vec<_>>(),
             vec!["127.0.0.1:1002".parse::<SocketAddr>().unwrap()]
         );
@@ -846,7 +848,7 @@ mod cmns_tests {
                 )
             };
             assert_eq!(
-                selected.unwrap().ip_addrs().collect::<Vec<_>>(),
+                selected.unwrap().ip_addrs().copied().collect::<Vec<_>>(),
                 vec!["127.0.0.1:1003".parse::<SocketAddr>().unwrap()]
             );
             assert!(other.is_err());
@@ -883,7 +885,7 @@ mod cmns_tests {
                 };
                 if actual_label == label {
                     assert_eq!(
-                        result.unwrap().ip_addrs().collect::<Vec<_>>(),
+                        result.unwrap().ip_addrs().copied().collect::<Vec<_>>(),
                         vec!["127.0.0.1:2001".parse::<SocketAddr>().unwrap()]
                     );
                 } else {
