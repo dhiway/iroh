@@ -705,6 +705,8 @@ mod tests {
 
 #[cfg(test)]
 mod cmns_tests {
+    use std::net::SocketAddr;
+
     use iroh_base::{CustomAddr, SecretKey, TransportAddr};
     use simple_dns::{CLASS, Name, Packet, ResourceRecord, rdata::RData};
 
@@ -811,14 +813,14 @@ mod cmns_tests {
                 .unwrap()
                 .ip_addrs()
                 .collect::<Vec<_>>(),
-            vec!["127.0.0.1:1001".parse().unwrap()]
+            vec!["127.0.0.1:1001".parse::<SocketAddr>().unwrap()]
         );
         assert_eq!(
             EndpointInfo::from_cmns_pkarr_signed_packet(&packet)
                 .unwrap()
                 .ip_addrs()
                 .collect::<Vec<_>>(),
-            vec!["127.0.0.1:1002".parse().unwrap()]
+            vec!["127.0.0.1:1002".parse::<SocketAddr>().unwrap()]
         );
         assert_eq!(packet.as_bytes(), before);
         for (valid, invalid) in [
@@ -845,7 +847,7 @@ mod cmns_tests {
             };
             assert_eq!(
                 selected.unwrap().ip_addrs().collect::<Vec<_>>(),
-                vec!["127.0.0.1:1003".parse().unwrap()]
+                vec!["127.0.0.1:1003".parse::<SocketAddr>().unwrap()]
             );
             assert!(other.is_err());
         }
@@ -882,7 +884,7 @@ mod cmns_tests {
                 if actual_label == label {
                     assert_eq!(
                         result.unwrap().ip_addrs().collect::<Vec<_>>(),
-                        vec!["127.0.0.1:2001".parse().unwrap()]
+                        vec!["127.0.0.1:2001".parse::<SocketAddr>().unwrap()]
                     );
                 } else {
                     let error = result.unwrap_err();
