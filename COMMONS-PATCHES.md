@@ -34,3 +34,16 @@ Existing constructors still select `_iroh`; publishing is unchanged. Missing
 selected records retain native empty-data behavior, without fallback. These
 readers do not establish chain authority, packet freshness or host integration.
 Offline custom-resolver and loopback HTTP tests exercise the real resolve paths.
+
+
+T268.128 exposes `iroh_dns_server::Server::run_until_done(&mut self)` for host-owned
+completion selection without consuming or stopping the server. Pending wait
+cancellation preserves native serving and lookup ownership. Existing `join`
+delegates to the borrowed wait, then retains its cleanup and original-error
+precedence. Terminal notifications are not repeatable-result, readiness or drain
+certificates; hosts must retain and await the single consuming shutdown future.
+The HTTP/HTTPS constructor requirement, native DNS transport and complete
+HTTP/TLS/ACME task ownership remain unchanged. Bounded loopback tests cover
+HTTP-only, HTTPS-only and combined waiting, retry and entered-future destruction,
+plus top-level failure and competing cleanup errors. This is a native lifecycle
+seam, not chain host, Statement policy or deployment qualification.

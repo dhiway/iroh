@@ -230,6 +230,14 @@ impl HttpServer {
         Ok(prepared)
     }
 
+    #[cfg(test)]
+    pub(crate) fn spawn_test_task(
+        &mut self,
+        task: BoxFuture<std::io::Result<()>>,
+    ) -> tokio::task::AbortHandle {
+        self.tasks.spawn(task)
+    }
+
     /// Get the bound address of the HTTP socket.
     pub(crate) fn http_addr(&self) -> Option<SocketAddr> {
         self.http_addr
@@ -407,7 +415,7 @@ async fn metrics_middleware(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use iroh::{
@@ -531,7 +539,7 @@ mod tests {
         Ok(())
     }
 
-    mod tls {
+    pub(crate) mod tls {
         use std::sync::Arc;
 
         use rustls::{
@@ -601,7 +609,7 @@ mod tests {
             }
         }
 
-        pub(super) fn insecure_tls_config() -> ClientConfig {
+        pub(crate) fn insecure_tls_config() -> ClientConfig {
             let mut cfg = ClientConfig::builder_with_provider(Arc::new(
                 rustls::crypto::ring::default_provider(),
             ))

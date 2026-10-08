@@ -55,6 +55,22 @@ request-serving or ACME tasks. Cancelled preparation drops unstarted work; all
 DNS, HTTP and ACME start synchronously after the last startup await. ACME maintenance is
 owned with the HTTP tasks and participates in completion, failure and shutdown.
 
+An embedded host can select `Server::run_until_done(&mut self)` against its own
+stop signal while retaining the server. Cancelling a pending borrowed wait leaves
+serving and entered lookups owned and running; it may wait again or shut down.
+A terminal result is a lifecycle notification, not readiness, authority or a drain
+certificate, and is not guaranteed to repeat. Stop admission after a terminal
+result and retain the single consuming `Server::shutdown` future until completion.
+If temporarily timing out while borrowing a pinned shutdown future, continue to
+own and await that same future; dropping it cannot establish cleanup. Preserve an
+original listener error separately if cleanup also fails. `Server::join` combines
+this wait and cleanup, returning the original error first, or a cleanup error when
+waiting succeeded. Metrics are not part of this completion wait.
+
+At least one HTTP or HTTPS listener is required. HTTP-only, HTTPS-only and combined
+configurations retain native DNS and HTTP/TLS task ownership, including ACME
+maintenance when configured. The borrowed wait adds no listener or host policy.
+
 Retain and await `Server::shutdown` or `Server::join` through completion, including
 errors. Cleanup notifies native HTTP connections, cancels native DNS transports,
 awaits listener tasks, and drains entered host lookup futures. That drain proves
