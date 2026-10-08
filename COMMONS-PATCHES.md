@@ -47,3 +47,17 @@ HTTP/TLS/ACME task ownership remain unchanged. Bounded loopback tests cover
 HTTP-only, HTTPS-only and combined waiting, retry and entered-future destruction,
 plus top-level failure and competing cleanup errors. This is a native lifecycle
 seam, not chain host, Statement policy or deployment qualification.
+
+T268.129 tracks whether the native relay supervisor result remains owned by
+`iroh_relay::server::Server`. A pending cancelled borrowed `join` retains that
+ownership; a terminal wait consumes it before returning either error level.
+`shutdown` still signals relay/QAD and awaits metrics cleanup, then consumes any
+unobserved supervisor result without polling an already-consumed task again.
+The public no-services path reproduced Tokio's repeated-poll panic before this
+repair. Bounded loopback regressions cover pending cancellation, native serving,
+success and inner/outer failures, plus separately owned metrics listener release.
+Callers retain the observed join result, await one consuming shutdown future and
+then propagate the result; terminal join is not repeatable. Native admission,
+wire/configuration, supervisor and public signatures remain unchanged. The
+binary's discarded join result remains a separately owned caller correction;
+this is not host integration, publication or qualification evidence.

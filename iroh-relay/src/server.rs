@@ -631,7 +631,7 @@ pub struct Server {
     /// Handle to the quic server.
     quic_handle: Option<QuicServerHandle>,
     /// The main task running the server.
-    supervisor: AbortOnDropHandle<Result<(), SupervisorError>>,
+    supervisor: Option<AbortOnDropHandle<Result<(), SupervisorError>>>,
     metrics: RelayMetrics,
     metrics_server: Option<iroh_metrics::service::MetricsServer>,
 }
@@ -866,7 +866,7 @@ impl Server {
             relay_handle,
             relay_service,
             quic_handle,
-            supervisor: AbortOnDropHandle::new(task),
+            supervisor: Some(AbortOnDropHandle::new(task)),
             metrics,
             metrics_server,
         })
@@ -874,7 +874,13 @@ impl Server {
 
     /// Requests graceful shutdown.
     ///
-    /// Returns once all server tasks have stopped.
+    /// Returns once all server tasks have stopped. If [`Self::join`] already delivered
+    /// the supervisor result, this only finishes remaining cleanup; the caller retains
+    /// responsibility for that result. Otherwise this returns the unconsumed result,
+    /// including a task that finished before shutdown was requested.
+    ///
+    /// Retain and await one consuming shutdown future to completion. Dropping it, for
+    /// example after a timeout, does not certify that cleanup finished.
     pub async fn shutdown(self) -> Result<(), SupervisorError> {
         // Only the Relay server and QUIC server need shutting down, the supervisor will abort the tasks in
         // the JoinSet when the server terminates.
@@ -887,7 +893,10 @@ impl Server {
         if let Some(server) = self.metrics_server {
             server.shutdown().await;
         }
-        self.supervisor.await?
+        match self.supervisor {
+            Some(supervisor) => supervisor.await?,
+            None => Ok(()),
+        }
     }
 
     /// Waits for the server's supervisor task to finish.
@@ -897,8 +906,24 @@ impl Server {
     /// example, after an internal error or because the supervisor was aborted from
     /// elsewhere). The outer [`JoinError`] is only produced if the supervisor task itself
     /// panics or is aborted.
+    ///
+    /// Cancelling a pending wait leaves the task owned by the server, so the wait can
+    /// be retried or followed by [`Self::shutdown`]. Any terminal result consumes the
+    /// task output. Retain that result, finish shutdown, then propagate the result;
+    /// successful cleanup does not replace a previously observed supervisor error.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called again after a preceding call returned a terminal result.
     pub async fn join(&mut self) -> Result<Result<(), SupervisorError>, JoinError> {
-        (&mut self.supervisor).await
+        let result = self
+            .supervisor
+            .as_mut()
+            .expect("supervisor result already consumed")
+            .await;
+        // Clear ownership before returning either the inner result or outer JoinError.
+        self.supervisor.take();
+        result
     }
 
     /// The socket address the HTTPS server is listening on.
@@ -1637,5 +1662,264 @@ mod tests {
 
         server.shutdown().await.context("relay server shutdown")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use std::{
+        future::{Future, poll_fn},
+        net::{Ipv4Addr, SocketAddr},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        task::Poll,
+        time::Duration,
+    };
+
+    use n0_future::task::AbortOnDropHandle;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+
+    use super::{RelayConfig, Server, ServerConfig, SupervisorError};
+
+    async fn bounded(future: impl Future<Output = ()>) {
+        tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .expect("whole scenario timeout");
+    }
+
+    async fn metrics_server(relay: bool) -> (Server, SocketAddr) {
+        let server = Server::spawn(ServerConfig {
+            relay: relay.then(|| RelayConfig::new((Ipv4Addr::LOCALHOST, 0))),
+            metrics_addr: Some((Ipv4Addr::LOCALHOST, 0).into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let addr = server.metrics_server.as_ref().unwrap().local_addr();
+        (server, addr)
+    }
+
+    async fn assert_serving(addr: SocketAddr) {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        assert!(String::from_utf8_lossy(&response).contains("iroh.computer"));
+    }
+
+    async fn assert_metrics_live(addr: SocketAddr) {
+        // Drop this connection before shutdown so it cannot hold graceful HTTP drain open.
+        drop(
+            TcpStream::connect(addr)
+                .await
+                .expect("metrics still listens"),
+        );
+    }
+
+    async fn assert_metrics_released(addr: SocketAddr) {
+        let listener = TcpListener::bind(addr)
+            .await
+            .expect("metrics listener released");
+        drop(listener);
+    }
+
+    async fn poll_then_cancel_join(server: &mut Server) {
+        let mut wait = Box::pin(server.join());
+        poll_fn(|cx| {
+            assert!(
+                wait.as_mut().poll(cx).is_pending(),
+                "native supervisor still running"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        drop(wait);
+        assert!(
+            server
+                .supervisor
+                .as_ref()
+                .is_some_and(|task| !task.is_finished())
+        );
+    }
+
+    async fn wait_finished(server: &Server) {
+        // Observe completion without taking the supervisor output.
+        while !server.supervisor.as_ref().unwrap().is_finished() {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    struct Destroyed(Arc<AtomicBool>);
+    impl Drop for Destroyed {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    async fn inject_outer_failure(server: &mut Server, panic: bool) -> Arc<AtomicBool> {
+        // Only outer JoinError fixtures replace the private task. Real native no-services
+        // completion, relay serving and metrics ownership are exercised separately.
+        wait_finished(server).await;
+        drop(server.supervisor.take());
+        let destroyed = Arc::new(AtomicBool::new(false));
+        let witness = destroyed.clone();
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        server.supervisor = Some(AbortOnDropHandle::new(tokio::spawn(async move {
+            let _guard = Destroyed(witness);
+            entered.send(()).unwrap();
+            if panic {
+                panic!("injected supervisor panic");
+            }
+            std::future::pending::<Result<(), SupervisorError>>().await
+        })));
+        entered_rx.await.unwrap();
+        if !panic {
+            server.supervisor.as_ref().unwrap().abort();
+        }
+        wait_finished(server).await;
+        assert!(
+            destroyed.load(Ordering::SeqCst),
+            "entered task future destroyed"
+        );
+        destroyed
+    }
+
+    #[tokio::test]
+    async fn no_services_join_then_shutdown() {
+        bounded(async {
+            let mut server = Server::spawn(ServerConfig::default()).await.unwrap();
+            let result = server.join().await.expect("native supervisor completed");
+            assert!(matches!(
+                result,
+                Err(SupervisorError::NoRelayServicesEnabled { .. })
+            ));
+            server
+                .shutdown()
+                .await
+                .expect("consumed result must not be polled again");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pending_join_cancel_then_native_success() {
+        bounded(async {
+            let (mut server, metrics) = metrics_server(true).await;
+            let addr = server.http_addr().unwrap();
+            assert_serving(addr).await;
+            poll_then_cancel_join(&mut server).await;
+            assert_serving(addr).await;
+            server.relay_handle.as_ref().unwrap().shutdown();
+            server.join().await.unwrap().unwrap();
+            assert!(server.supervisor.is_none());
+            assert_metrics_live(metrics).await;
+            server.shutdown().await.unwrap();
+            assert_metrics_released(metrics).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pending_join_cancel_then_direct_shutdown() {
+        bounded(async {
+            let (mut server, metrics) = metrics_server(true).await;
+            let addr = server.http_addr().unwrap();
+            poll_then_cancel_join(&mut server).await;
+            assert_serving(addr).await;
+            server.shutdown().await.unwrap();
+            assert_metrics_released(metrics).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn native_inner_error_join_then_metrics_cleanup() {
+        bounded(async {
+            let (mut server, metrics) = metrics_server(false).await;
+            assert!(matches!(
+                server.join().await.unwrap(),
+                Err(SupervisorError::NoRelayServicesEnabled { .. })
+            ));
+            assert!(server.supervisor.is_none());
+            assert_metrics_live(metrics).await;
+            server.shutdown().await.unwrap();
+            assert_metrics_released(metrics).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unobserved_native_inner_error_direct_shutdown() {
+        bounded(async {
+            let (server, metrics) = metrics_server(false).await;
+            wait_finished(&server).await;
+            assert_metrics_live(metrics).await;
+            assert!(matches!(
+                server.shutdown().await,
+                Err(SupervisorError::NoRelayServicesEnabled { .. })
+            ));
+            assert_metrics_released(metrics).await;
+        })
+        .await;
+    }
+
+    async fn outer_error_join_then_cleanup(panic: bool) {
+        let (mut server, metrics) = metrics_server(false).await;
+        let destroyed = inject_outer_failure(&mut server, panic).await;
+        let error = server
+            .join()
+            .await
+            .expect_err("outer task failure delivered");
+        assert_eq!(error.is_panic(), panic);
+        assert_eq!(error.is_cancelled(), !panic);
+        assert!(server.supervisor.is_none());
+        assert_metrics_live(metrics).await;
+        server.shutdown().await.unwrap();
+        assert_metrics_released(metrics).await;
+        assert!(destroyed.load(Ordering::SeqCst));
+    }
+
+    async fn unobserved_outer_error_direct_shutdown(panic: bool) {
+        let (mut server, metrics) = metrics_server(false).await;
+        let destroyed = inject_outer_failure(&mut server, panic).await;
+        assert_metrics_live(metrics).await;
+        match server.shutdown().await {
+            Err(SupervisorError::JoinError { source, .. }) => {
+                assert_eq!(source.is_panic(), panic);
+                assert_eq!(source.is_cancelled(), !panic);
+            }
+            other => panic!("expected converted outer JoinError, got {other:?}"),
+        }
+        assert_metrics_released(metrics).await;
+        assert!(destroyed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn outer_cancellation_join_then_cleanup() {
+        bounded(outer_error_join_then_cleanup(false)).await;
+    }
+
+    #[tokio::test]
+    async fn outer_panic_join_then_cleanup() {
+        bounded(outer_error_join_then_cleanup(true)).await;
+    }
+
+    #[tokio::test]
+    async fn unobserved_outer_cancellation_direct_shutdown() {
+        bounded(unobserved_outer_error_direct_shutdown(false)).await;
+    }
+
+    #[tokio::test]
+    async fn unobserved_outer_panic_direct_shutdown() {
+        bounded(unobserved_outer_error_direct_shutdown(true)).await;
     }
 }

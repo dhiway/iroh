@@ -151,6 +151,24 @@ iroh = { version = "0.95", features = ["test-utils"] }
 This will start a relay server with a self-signed TLS certificate, listening on a localhost port, and return the server's URL.
 - For the iroh endpoints to successfully connect to the relay, disable TLS certificate verification by calling [`Endpoint::ca_tls_config`](https://docs.rs/iroh/latest/iroh/endpoint/struct.Builder.html#method.ca_tls_config) with  `CaRootConfig::insecure_skip_verify()`.
 
+## Embedded server lifecycle
+
+`Server::join(&mut self)` waits without requesting shutdown. Cancelling a pending
+wait preserves the native supervisor, so a host may retry the wait or call
+`shutdown`. A terminal result exhausts `join`; calling it again panics.
+
+Keep the result returned by `join`, retain and await one consuming
+`shutdown(self)` future to completion, then propagate the observed result.
+Shutdown still signals the native relay/QAD services and awaits the separately
+owned metrics server. It consumes any unobserved supervisor result, even if the
+task has already finished, but does not replay a result already delivered by
+`join`. Successful cleanup therefore does not erase an observed error. A timeout
+or dropped shutdown future is not evidence of completed cleanup.
+
+This library contract does not establish binary failure reporting: the current
+binary caller discards its `join` result and needs a separate caller correction.
+No chain authority, host deployment or release qualification is supplied here.
+
 # License
 
 This project is licensed under either of
