@@ -73,3 +73,21 @@ failure; bounded executable tests cover native no-services failure and healthy
 loopback serving followed by owned-PID SIGINT. Process exit/listener release
 supplement, rather than prove, awaited cleanup. No public API, dependencies,
 configuration, wire behavior, host integration or qualification changes.
+
+
+T268.133 completes awaited native relay startup rollback and HTTP cleanup. Failed
+startup drains already-created HTTP, captive and metrics resources before returning
+its original error. The native supervisor tracks consumed results, awaits remaining
+HTTP and captive work, and defers primary panic propagation until cleanup. Explicit
+HTTP/captive child panics likewise follow connection-group drain. A secondary HTTP
+failure propagates after primary success without replacing an earlier error.
+
+WebSocket upgrade admission is closed atomically against tracked spawning. Native
+handshake/authorization tasks are cancelled and awaited before registered-client
+drain; tasks do not retain their external cancellation owner. Closed upgrades
+receive HTTP 503. Reentrant shutdown from an access callback cancels that callback;
+an external owner retains and awaits shutdown. Dropped futures, concurrent registry
+drains and QAD descendants are outside stronger completion claims. Private tests
+exercise actual local native builders/loops, pending bodies and authorization,
+startup failures, panic precedence, closure/registration races and owner drop.
+No public signature, dependency, wire format, host policy or qualification changes.

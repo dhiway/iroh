@@ -170,7 +170,26 @@ original outer or inner failure before any cleanup failure. Without an observed
 join result, it propagates shutdown's result. Ordinary Ctrl-C shutdown and native
 successful completion remain successful. The existing biased Ctrl-C selection,
 including signal-registration error behavior, is unchanged.
-No chain authority, host deployment or release qualification is supplied here.
+Awaited startup errors now drain resources created before the failure and return the
+original startup error. Supervisor completion signals and awaits HTTP and captive
+connection work before reporting an auxiliary failure or resuming its panic. A
+newly observed HTTP cleanup failure propagates when the primary result succeeded;
+an earlier failure retains precedence. The native HTTP and captive loops drain
+remaining connections before propagating their explicit child-panic errors.
+
+Embedded `RelayService::shutdown` atomically closes WebSocket upgrade admission,
+cancels and awaits accepted handshake/authorization work, then drains registered
+clients. Closed services refuse new upgrades with HTTP 503. Dropping the last
+external service owner requests upgrade cancellation without retaining itself in
+those tasks; drop alone is not a completion certificate. Calling shutdown inside
+an access callback cancels and destroys that callback before its own wait returns.
+An external owner must retain the native shutdown future. Concurrent/repeated
+client-registry drains or external registry mutation do not establish this barrier.
+
+Tests use local native listeners and entered/destruction witnesses. Metrics remain
+separately owned, and QAD retains its existing native shutdown behavior; this patch
+does not establish stronger QAD descendant guarantees. No chain authority, host
+deployment or release qualification is supplied here.
 
 # License
 

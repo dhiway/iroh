@@ -6,7 +6,13 @@
 //!
 //! For a complete relay server implementation, see the parent [`server`](super) module.
 
-use std::{collections::HashMap, convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use bytes::Bytes;
 use derive_more::Debug;
@@ -28,7 +34,10 @@ use tokio::{
     sync::{Notify, watch},
 };
 use tokio_rustls_acme::AcmeAcceptor;
-use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
+use tokio_util::{
+    sync::CancellationToken,
+    task::{AbortOnDropHandle, TaskTracker},
+};
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 
 use super::{
@@ -473,6 +482,7 @@ impl ServerBuilder {
                 let service = loop_service;
                 // create a join set to track all our connection tasks
                 let mut set = tokio::task::JoinSet::new();
+                let mut child_panic = None;
                 loop {
                     tokio::select! {
                         biased;
@@ -483,7 +493,8 @@ impl ServerBuilder {
                             if let Err(err) = res
                                 && err.is_panic()
                             {
-                                panic!("task panicked: {err:#?}");
+                                child_panic = Some(err);
+                                break;
                             }
                         }
                         res = listener.accept() => match res {
@@ -506,6 +517,7 @@ impl ServerBuilder {
                 }
                 service.shutdown().await;
                 set.shutdown().await;
+                if let Some(err) = child_panic { panic!("task panicked: {err:#?}"); }
                 debug!("server has been shutdown.");
             }
             .instrument(info_span!("relay-http-serve")),
@@ -524,7 +536,31 @@ impl ServerBuilder {
 ///
 /// This service can be used standalone or embedded into an existing HTTP server.
 #[derive(Clone, Debug)]
-pub struct RelayService(Arc<Inner>);
+pub struct RelayService(Arc<Inner>, Arc<UpgradeOwner>);
+
+// Tasks capture Inner and a token clone, not this external lifetime owner.
+#[derive(Debug)]
+struct UpgradeOwner {
+    open: Mutex<bool>,
+    cancel: CancellationToken,
+    tasks: TaskTracker,
+}
+impl UpgradeOwner {
+    fn close(&self) {
+        *self
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        // Never cancel/drop work or invoke callbacks while the admission gate is held.
+        self.cancel.cancel();
+        self.tasks.close();
+    }
+}
+impl Drop for UpgradeOwner {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
 
 #[derive(Debug)]
 struct Inner {
@@ -628,32 +664,53 @@ impl RelayServiceWithNotify {
         // Note: This can't possibly be fulfilled until the 101 response
         // is returned below, so it's better to spawn this future instead
         // waiting for it to complete to then return a response.
-        tokio::task::spawn({
-            let this = self.clone();
+        let open = self
+            .service
+            .1
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*open {
+            return Ok(self
+                .build_response()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(body_full("relay service is closed"))
+                .expect("valid body"));
+        }
+        let cancel = self.service.1.cancel.clone();
+        self.service.1.tasks.spawn({
+            let inner = self.service.0.clone();
+            let on_establish = self.on_establish.clone();
             async move {
-                match hyper::upgrade::on(&mut req).await {
-                    Ok(upgraded) => {
-                        let (parts, _) = req.into_parts();
-                        if let Err(err) = this
-                            .service
-                            .0
-                            .relay_connection_handler(upgraded, parts, protocol_version)
-                            .await
-                        {
-                            warn!("error accepting upgraded connection: {err:#}",);
-                        } else {
-                            // We have passed the connection to the relay protocol handler,
-                            // thus we trigger the on_establish notification so that timeouts
-                            // on the upper layer will be cleared.
-                            this.on_establish.notify_waiters();
-                            debug!("upgraded connection completed");
-                        };
+                let upgrade = async move {
+                    match hyper::upgrade::on(&mut req).await {
+                        Ok(upgraded) => {
+                            let (parts, _) = req.into_parts();
+                            if let Err(err) = inner
+                                .relay_connection_handler(upgraded, parts, protocol_version)
+                                .await
+                            {
+                                warn!("error accepting upgraded connection: {err:#}",);
+                            } else {
+                                // We have passed the connection to the relay protocol handler,
+                                // thus we trigger the on_establish notification so that timeouts
+                                // on the upper layer will be cleared.
+                                on_establish.notify_waiters();
+                                debug!("upgraded connection completed");
+                            };
+                        }
+                        Err(err) => warn!("upgrade error: {err:#}"),
                     }
-                    Err(err) => warn!("upgrade error: {err:#}"),
+                };
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => (),
+                    _ = upgrade => (),
                 }
             }
             .instrument(info_span!("handler"))
         });
+        drop(open);
 
         // Now return a 101 Response saying we agree to the upgrade to the
         // websocket upgrade protocol
@@ -921,16 +978,23 @@ impl RelayService {
         access: Arc<dyn DynAccessControl>,
         metrics: Arc<Metrics>,
     ) -> Self {
-        Self(Arc::new(Inner {
-            handlers,
-            headers,
-            clients: Clients::default(),
-            write_timeout: SERVER_WRITE_TIMEOUT,
-            rate_limit: watch::Sender::new(rate_limit),
-            key_cache,
-            access,
-            metrics,
-        }))
+        Self(
+            Arc::new(Inner {
+                handlers,
+                headers,
+                clients: Clients::default(),
+                write_timeout: SERVER_WRITE_TIMEOUT,
+                rate_limit: watch::Sender::new(rate_limit),
+                key_cache,
+                access,
+                metrics,
+            }),
+            Arc::new(UpgradeOwner {
+                open: Mutex::new(true),
+                cancel: CancellationToken::new(),
+                tasks: TaskTracker::new(),
+            }),
+        )
     }
 
     /// Updates the per-client receive rate limit.
@@ -941,8 +1005,15 @@ impl RelayService {
         self.0.rate_limit.send_replace(rate_limit);
     }
 
-    /// Shuts down the relay service, disconnecting all clients.
+    /// Closes upgrade admission, cancels and awaits accepted upgrades, then disconnects clients.
+    ///
+    /// Retain one shutdown future until completion. Dropping it or concurrently draining
+    /// the public client registry does not certify cleanup. Calling this from an access
+    /// callback requests closure but cancellation destroys that callback before its own
+    /// shutdown wait can return; an external owner must finish the native shutdown.
     pub async fn shutdown(&self) {
+        self.1.close();
+        self.1.tasks.wait().await;
         self.0.clients.shutdown().await;
     }
 
@@ -1209,6 +1280,302 @@ mod tests {
         protos::relay::{ClientToRelayMsg, Datagrams, RelayToClientMsg},
         tls::{CaTlsConfig, default_provider},
     };
+
+    #[derive(std::fmt::Debug)]
+    struct PendingAccess {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+    struct AccessDropped(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for AccessDropped {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    impl crate::server::AccessControl for PendingAccess {
+        async fn on_connect(&self, _: &ClientRequest) -> crate::server::Access {
+            let _guard = AccessDropped(self.dropped.clone());
+            self.entered.notify_one();
+            self.release.notified().await;
+            crate::server::Access::Deny {
+                reason: Some("fixture denied".into()),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleanup_pending_native_authorization() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let access = Arc::new(PendingAccess {
+                entered: entered.clone(),
+                release: release.clone(),
+                dropped: dropped.clone(),
+            });
+            let mut server = ServerBuilder::new("127.0.0.1:0".parse().unwrap())
+                .access(access)
+                .spawn()
+                .await
+                .unwrap();
+            let url = format!("http://{}", server.addr()).parse().unwrap();
+            let connect = tokio::spawn(create_test_client(SecretKey::from_bytes(&[31; 32]), url));
+            entered.notified().await;
+            server.service().shutdown().await;
+            let destroyed_at_shutdown = dropped.load(std::sync::atomic::Ordering::SeqCst);
+            // Release and join the old detached task before reporting the baseline failure.
+            release.notify_one();
+            while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            assert!(connect.await.unwrap().is_err());
+            server.shutdown();
+            server.task_handle().await.unwrap();
+            assert!(
+                destroyed_at_shutdown,
+                "authorization outlived native service shutdown"
+            );
+        })
+        .await
+        .expect("whole authorization scenario");
+    }
+
+    async fn raw_upgrade(addr: SocketAddr) -> TcpStream {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "GET /relay HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: ZmFrZS1rZXktMTIzNDU2Nw==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: {}\r\n\r\n",
+            ProtocolVersion::all_joined()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream
+    }
+    async fn response_head(stream: &mut TcpStream) -> Vec<u8> {
+        let mut response = Vec::new();
+        while !response.ends_with(b"\r\n\r\n") {
+            let byte = stream.read_u8().await.unwrap();
+            response.push(byte);
+        }
+        response
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleanup_upgrade_handshake_and_closed_admission() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut server = ServerBuilder::new("127.0.0.1:0".parse().unwrap())
+                .spawn()
+                .await
+                .unwrap();
+            let mut peer = raw_upgrade(server.addr()).await;
+            assert!(response_head(&mut peer).await.starts_with(b"HTTP/1.1 101"));
+            // WebSocket established, native authentication has not been supplied.
+            assert_eq!(server.service().1.tasks.len(), 1);
+            server.service().shutdown().await;
+            assert!(server.service().1.tasks.is_empty());
+            let mut response = Vec::new();
+            let result = peer.read_to_end(&mut response).await;
+            assert!(
+                result.is_ok() || result.unwrap_err().kind() == std::io::ErrorKind::ConnectionReset
+            );
+            let mut refused = raw_upgrade(server.addr()).await;
+            assert!(
+                response_head(&mut refused)
+                    .await
+                    .starts_with(b"HTTP/1.1 503")
+            );
+            assert!(
+                server.service().1.tasks.is_empty(),
+                "closed gate must prevent tracked spawning"
+            );
+            drop((peer, refused));
+            server.shutdown();
+            server.task_handle().await.unwrap();
+        })
+        .await
+        .expect("whole handshake scenario");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleanup_owner_drop_cancels_without_task_cycle() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let entered = Arc::new(Notify::new());
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let access = Arc::new(PendingAccess {
+                entered: entered.clone(),
+                release: Arc::new(Notify::new()),
+                dropped: dropped.clone(),
+            });
+            let server = ServerBuilder::new("127.0.0.1:0".parse().unwrap())
+                .access(access)
+                .spawn()
+                .await
+                .unwrap();
+            let owner = Arc::downgrade(&server.service().1);
+            let connect = tokio::spawn(create_test_client(
+                SecretKey::from_bytes(&[32; 32]),
+                format!("http://{}", server.addr()).parse().unwrap(),
+            ));
+            entered.notified().await;
+            drop(server); // cancellation request only; observe actual destruction separately.
+            while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            assert!(connect.await.unwrap().is_err());
+            assert!(
+                owner.upgrade().is_none(),
+                "upgrade cannot retain its cancellation owner"
+            );
+        })
+        .await
+        .expect("whole owner-drop scenario");
+    }
+
+    #[derive(std::fmt::Debug)]
+    struct ReentrantAccess {
+        service: Mutex<Option<(std::sync::Weak<Inner>, std::sync::Weak<UpgradeOwner>)>>,
+        entered: Arc<Notify>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+        returned: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl crate::server::AccessControl for ReentrantAccess {
+        async fn on_connect(&self, _: &ClientRequest) -> crate::server::Access {
+            let _guard = AccessDropped(self.dropped.clone());
+            let service = {
+                let weak = self.service.lock().unwrap();
+                let (inner, owner) = weak.as_ref().unwrap();
+                RelayService(inner.upgrade().unwrap(), owner.upgrade().unwrap())
+            };
+            self.entered.notify_one();
+            service.shutdown().await;
+            self.returned
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            crate::server::Access::Allow
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleanup_reentrant_callback_is_destroyed_not_self_waited() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let access = Arc::new(ReentrantAccess {
+                service: Mutex::new(None),
+                entered: Arc::new(Notify::new()),
+                dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                returned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            });
+            let mut server = ServerBuilder::new("127.0.0.1:0".parse().unwrap())
+                .access(access.clone())
+                .spawn()
+                .await
+                .unwrap();
+            *access.service.lock().unwrap() = Some((
+                Arc::downgrade(&server.service().0),
+                Arc::downgrade(&server.service().1),
+            ));
+            let connect = tokio::spawn(create_test_client(
+                SecretKey::from_bytes(&[33; 32]),
+                format!("http://{}", server.addr()).parse().unwrap(),
+            ));
+            access.entered.notified().await;
+            server.shutdown();
+            server.task_handle().await.unwrap(); // one retained external native shutdown owner.
+            assert!(connect.await.unwrap().is_err());
+            assert!(access.dropped.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(!access.returned.load(std::sync::atomic::Ordering::SeqCst));
+        })
+        .await
+        .expect("whole reentrant scenario");
+    }
+
+    #[derive(std::fmt::Debug)]
+    struct RaceAccess {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+        disconnects: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl crate::server::AccessControl for RaceAccess {
+        async fn on_connect(&self, _: &ClientRequest) -> crate::server::Access {
+            self.entered.notify_one();
+            self.release.notified().await;
+            crate::server::Access::Allow
+        }
+        fn on_disconnect(&self, _: iroh_base::EndpointId, _: crate::server::ConnectionId) {
+            self.disconnects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    async fn registration_order(allow_first: bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let access = Arc::new(RaceAccess {
+                entered: Arc::new(Notify::new()),
+                release: Arc::new(Notify::new()),
+                disconnects: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            });
+            let mut server = ServerBuilder::new("127.0.0.1:0".parse().unwrap())
+                .access(access.clone())
+                .spawn()
+                .await
+                .unwrap();
+            let key = SecretKey::from_bytes(&[34; 32]);
+            let endpoint = key.public();
+            let connect = tokio::spawn(create_test_client(
+                key,
+                format!("http://{}", server.addr()).parse().unwrap(),
+            ));
+            access.entered.notified().await;
+            access.release.notify_one();
+            if allow_first {
+                let (_, mut client) = connect.await.unwrap().unwrap();
+                // Actual native ping proves registration, beyond handshake completion.
+                client.send(ClientToRelayMsg::Ping([7; 8])).await.unwrap();
+                assert!(matches!(
+                    client.next().await.unwrap().unwrap(),
+                    RelayToClientMsg::Pong { .. }
+                ));
+                server.service().shutdown().await;
+                assert!(client.next().await.is_none());
+            } else {
+                // Release is ready but callback has not resumed; closure must win and drain.
+                server.service().shutdown().await;
+                assert!(connect.await.unwrap().is_err());
+            }
+            assert!(!server.service().clients().disconnect(endpoint, None));
+            assert_eq!(
+                access.disconnects.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(allow_first)
+            );
+            assert!(server.service().1.tasks.is_empty());
+            server.shutdown();
+            server.task_handle().await.unwrap();
+        })
+        .await
+        .expect("whole registration race scenario");
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleanup_close_wins_before_registration() {
+        registration_order(false).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleanup_registration_wins_then_client_is_drained() {
+        registration_order(true).await;
+    }
+
+    #[test]
+    fn cleanup_poisoned_admission_gate_can_close_and_drop() {
+        let owner = UpgradeOwner {
+            open: Mutex::new(true),
+            cancel: CancellationToken::new(),
+            tasks: TaskTracker::new(),
+        };
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _gate = owner.open.lock().unwrap();
+            panic!("task creation panic while admission is held");
+        }));
+        assert!(panic.is_err());
+        owner.close();
+        assert!(!*owner.open.lock().unwrap_err().into_inner());
+        assert!(owner.cancel.is_cancelled());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(owner))).is_ok());
+    }
 
     pub(crate) fn make_tls_config() -> TlsConfig {
         let subject_alt_names = vec!["localhost".to_string()];

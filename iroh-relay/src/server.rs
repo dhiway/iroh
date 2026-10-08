@@ -4,10 +4,10 @@
 //! used by the `iroh-relay` binary in this crate.  It can be used to run a relay server in
 //! other locations however.
 //!
-//! This code is fully written in a form of structured-concurrency: every spawned task is
-//! always attached to a handle and when the handle is dropped the tasks abort.  So tasks
-//! can not outlive their handle.  It is also always possible to await for completion of a
-//! task.  Some tasks additionally have a method to do graceful shutdown.
+//! Retain and await startup and shutdown futures to finish owned native cleanup. Dropping
+//! an owner requests cancellation; it does not itself await task destruction. Supervisor
+//! completion drains HTTP and captive connections; metrics cleanup remains separately
+//! owned by [`Server::shutdown`]. QAD uses its existing native shutdown primitive.
 //!
 //! The relay server hosts the following services:
 //!
@@ -51,6 +51,7 @@ use tokio_rustls_acme::{
     acme::{LETS_ENCRYPT_PRODUCTION_DIRECTORY, LETS_ENCRYPT_STAGING_DIRECTORY},
     caches::DirCache,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, instrument};
 
 use self::http_server::{BytesBody, HyperError, HyperResult};
@@ -709,128 +710,180 @@ impl Server {
             None
         };
 
-        let (relay_server, http_addr, tls_config) = match config.relay {
-            Some(relay_config) => {
-                debug!("Starting Relay server");
-                let mut headers = HeaderMap::new();
-                for (name, value) in TLS_HEADERS.iter() {
-                    headers.insert(
-                        *name,
-                        value
-                            .parse()
-                            .map_err(|err| e!(SpawnError::TlsHeaderParse, err))?,
-                    );
-                }
-                let relay_bind_addr = match relay_config.tls {
-                    Some(ref tls) => tls.https_bind_addr,
-                    None => relay_config.http_bind_addr,
-                };
-                let key_cache_capacity = relay_config
-                    .key_cache_capacity
-                    .unwrap_or(DEFAULT_KEY_CACHE_CAPACITY);
-                let mut builder = http_server::ServerBuilder::new(relay_bind_addr)
-                    .metrics(metrics.server.clone())
-                    .headers(headers)
-                    .key_cache_capacity(key_cache_capacity)
-                    .access(relay_config.access)
-                    .request_handler(Method::GET, "/", Box::new(root_handler))
-                    .request_handler(Method::GET, "/index.html", Box::new(root_handler))
-                    .request_handler(Method::GET, RELAY_PROBE_PATH, Box::new(probe_handler))
-                    .request_handler(Method::GET, "/robots.txt", Box::new(robots_handler))
-                    .request_handler(Method::GET, "/healthz", Box::new(healthz_handler));
-                if let Some(cfg) = relay_config.limits.client_rx {
-                    builder = builder.client_rx_ratelimit(cfg);
-                }
-                let (http_addr, tls_config) = match relay_config.tls {
-                    Some(tls_config) => {
-                        let server_tls_config = match tls_config.cert {
-                            CertConfig::LetsEncrypt {
-                                acme_config,
-                                server_config_builder,
-                            } => {
-                                let cache = acme_config.cache_path.map(DirCache::new);
-                                let crypto_provider =
-                                    server_config_builder.crypto_provider().clone();
-                                let client_tls_config = acme_config
-                                    .tls_config
-                                    .client_config(crypto_provider)
-                                    .map_err(|err| e!(SpawnError::AcmeClientTlsConfig, err))?;
-                                let config =
-                                    tokio_rustls_acme::AcmeConfig::new_with_client_tls_config(
-                                        acme_config.domains,
-                                        Arc::new(client_tls_config),
-                                    )
-                                    .contact(acme_config.contact)
-                                    .directory(acme_config.directory_url)
-                                    .cache_option(cache);
-                                let mut state = config.state();
-                                let resolver = state.resolver().clone();
-                                let server_config =
-                                    server_config_builder.with_cert_resolver(resolver);
-                                let acceptor =
-                                    http_server::TlsAcceptor::LetsEncrypt(state.acceptor());
-                                tasks.spawn(
-                                    async move {
-                                        while let Some(event) = state.next().await {
-                                            match event {
-                                                Ok(ok) => debug!("acme event: {ok:?}"),
-                                                Err(err) => error!("error: {err:?}"),
+        let mut relay_server = None;
+        let mut captive = None;
+        let startup = async {
+            let (http_addr, tls_config) = match config.relay {
+                Some(relay_config) => {
+                    debug!("Starting Relay server");
+                    let mut headers = HeaderMap::new();
+                    for (name, value) in TLS_HEADERS.iter() {
+                        headers.insert(
+                            *name,
+                            value
+                                .parse()
+                                .map_err(|err| e!(SpawnError::TlsHeaderParse, err))?,
+                        );
+                    }
+                    let relay_bind_addr = match relay_config.tls {
+                        Some(ref tls) => tls.https_bind_addr,
+                        None => relay_config.http_bind_addr,
+                    };
+                    let key_cache_capacity = relay_config
+                        .key_cache_capacity
+                        .unwrap_or(DEFAULT_KEY_CACHE_CAPACITY);
+                    let mut builder = http_server::ServerBuilder::new(relay_bind_addr)
+                        .metrics(metrics.server.clone())
+                        .headers(headers)
+                        .key_cache_capacity(key_cache_capacity)
+                        .access(relay_config.access)
+                        .request_handler(Method::GET, "/", Box::new(root_handler))
+                        .request_handler(Method::GET, "/index.html", Box::new(root_handler))
+                        .request_handler(Method::GET, RELAY_PROBE_PATH, Box::new(probe_handler))
+                        .request_handler(Method::GET, "/robots.txt", Box::new(robots_handler))
+                        .request_handler(Method::GET, "/healthz", Box::new(healthz_handler));
+                    if let Some(cfg) = relay_config.limits.client_rx {
+                        builder = builder.client_rx_ratelimit(cfg);
+                    }
+                    let (http_addr, tls_config) = match relay_config.tls {
+                        Some(tls_config) => {
+                            let server_tls_config = match tls_config.cert {
+                                CertConfig::LetsEncrypt {
+                                    acme_config,
+                                    server_config_builder,
+                                } => {
+                                    let cache = acme_config.cache_path.map(DirCache::new);
+                                    let crypto_provider =
+                                        server_config_builder.crypto_provider().clone();
+                                    let client_tls_config = acme_config
+                                        .tls_config
+                                        .client_config(crypto_provider)
+                                        .map_err(|err| e!(SpawnError::AcmeClientTlsConfig, err))?;
+                                    let config =
+                                        tokio_rustls_acme::AcmeConfig::new_with_client_tls_config(
+                                            acme_config.domains,
+                                            Arc::new(client_tls_config),
+                                        )
+                                        .contact(acme_config.contact)
+                                        .directory(acme_config.directory_url)
+                                        .cache_option(cache);
+                                    let mut state = config.state();
+                                    let resolver = state.resolver().clone();
+                                    let server_config =
+                                        server_config_builder.with_cert_resolver(resolver);
+                                    let acceptor =
+                                        http_server::TlsAcceptor::LetsEncrypt(state.acceptor());
+                                    tasks.spawn(
+                                        async move {
+                                            while let Some(event) = state.next().await {
+                                                match event {
+                                                    Ok(ok) => debug!("acme event: {ok:?}"),
+                                                    Err(err) => error!("error: {err:?}"),
+                                                }
                                             }
+                                            Err(e!(SupervisorError::AcmeEventStreamFinished))
                                         }
-                                        Err(e!(SupervisorError::AcmeEventStreamFinished))
+                                        .instrument(info_span!("acme")),
+                                    );
+                                    http_server::TlsConfig {
+                                        config: Arc::new(server_config),
+                                        acceptor,
                                     }
-                                    .instrument(info_span!("acme")),
-                                );
-                                http_server::TlsConfig {
-                                    config: Arc::new(server_config),
-                                    acceptor,
                                 }
-                            }
-                            CertConfig::Manual { server_config } => {
-                                let server_config = Arc::new(server_config);
-                                let acceptor =
-                                    tokio_rustls::TlsAcceptor::from(server_config.clone());
-                                let acceptor = http_server::TlsAcceptor::Manual(acceptor);
-                                http_server::TlsConfig {
-                                    config: server_config,
-                                    acceptor,
+                                CertConfig::Manual { server_config } => {
+                                    let server_config = Arc::new(server_config);
+                                    let acceptor =
+                                        tokio_rustls::TlsAcceptor::from(server_config.clone());
+                                    let acceptor = http_server::TlsAcceptor::Manual(acceptor);
+                                    http_server::TlsConfig {
+                                        config: server_config,
+                                        acceptor,
+                                    }
                                 }
-                            }
-                        };
-                        builder = builder.tls_config(Some(server_tls_config.clone()));
+                            };
+                            builder = builder.tls_config(Some(server_tls_config.clone()));
 
-                        // Some services always need to be served over HTTP without TLS.  Run
-                        // these standalone.
-                        let http_listener = TcpListener::bind(&relay_config.http_bind_addr)
-                            .await
-                            .map_err(|err| e!(SpawnError::BindTlsListener, err))?;
-                        let http_addr = http_listener
-                            .local_addr()
-                            .map_err(|err| e!(SpawnError::NoLocalAddr, err))?;
-                        tasks.spawn(
-                            async move {
-                                run_captive_portal_service(http_listener).await;
-                                Ok(())
-                            }
-                            .instrument(info_span!("http-service", addr = %http_addr)),
-                        );
-                        (Some(http_addr), Some(server_tls_config))
-                    }
-                    None => {
-                        // If running Relay without TLS add the plain HTTP server directly
-                        // to the Relay server.
-                        builder = builder.request_handler(
-                            Method::GET,
-                            "/generate_204",
-                            Box::new(serve_no_content_handler),
-                        );
-                        (None, None)
-                    }
-                };
-                let relay_server = builder.spawn().await?;
-                (Some(relay_server), http_addr, tls_config)
+                            // Some services always need to be served over HTTP without TLS.  Run
+                            // these standalone.
+                            let http_listener = TcpListener::bind(&relay_config.http_bind_addr)
+                                .await
+                                .map_err(|err| e!(SpawnError::BindTlsListener, err))?;
+                            let http_addr = http_listener
+                                .local_addr()
+                                .map_err(|err| e!(SpawnError::NoLocalAddr, err))?;
+                            let cancel = CancellationToken::new();
+                            let stop = cancel.clone();
+                            let id = tasks
+                                .spawn(
+                                    async move {
+                                        run_captive_portal_service(
+                                            http_listener,
+                                            stop,
+                                            #[cfg(test)]
+                                            None,
+                                        )
+                                        .await;
+                                        Ok(())
+                                    }
+                                    .instrument(info_span!("http-service", addr = %http_addr)),
+                                )
+                                .id();
+                            captive = Some((id, cancel));
+                            (Some(http_addr), Some(server_tls_config))
+                        }
+                        None => {
+                            // If running Relay without TLS add the plain HTTP server directly
+                            // to the Relay server.
+                            builder = builder.request_handler(
+                                Method::GET,
+                                "/generate_204",
+                                Box::new(serve_no_content_handler),
+                            );
+                            (None, None)
+                        }
+                    };
+                    relay_server = Some(builder.spawn().await?);
+                    (http_addr, tls_config)
+                }
+                None => (None, None),
+            };
+            let quic_server = match config.quic {
+                Some(quic_config) => {
+                    debug!("Starting QUIC server {}", quic_config.bind_addr);
+                    let server_config = quic_config
+                        .server_config
+                        .or(tls_config.map(|config| (*config.config).clone()))
+                        .ok_or_else(|| {
+                            e!(SpawnError::QuicSpawn, e!(QuicSpawnError::TlsNotConfigured))
+                        })?;
+                    Some(
+                        QuicServer::spawn(
+                            quic_config.bind_addr,
+                            server_config,
+                            metrics.server.clone(),
+                        )
+                        .map_err(|err| e!(SpawnError::QuicSpawn, err))?,
+                    )
+                }
+                None => None,
+            };
+            Ok::<_, SpawnError>((http_addr, quic_server))
+        }
+        .await;
+        let (http_addr, quic_server) = match startup {
+            Ok(started) => started,
+            Err(error) => {
+                if let Some(server) = relay_server.as_mut() {
+                    server.shutdown();
+                    let _ = server.task_handle().await;
+                }
+                let _ = drain_captive(&mut tasks, captive.take()).await;
+                tasks.shutdown().await;
+                if let Some(server) = metrics_server {
+                    server.shutdown().await;
+                }
+                return Err(error);
             }
-            None => (None, None, None),
         };
         // If http_addr is Some then relay_server is serving HTTPS.  If http_addr is None
         // relay_server is serving HTTP, including the /generate_204 service.
@@ -838,26 +891,10 @@ impl Server {
         let relay_handle = relay_server.as_ref().map(|srv| srv.handle());
         let relay_service = relay_server.as_ref().map(|srv| srv.service().clone());
 
-        let quic_server = match config.quic {
-            Some(quic_config) => {
-                debug!("Starting QUIC server {}", quic_config.bind_addr);
-                let server_config = quic_config
-                    .server_config
-                    .or(tls_config.map(|config| (*config.config).clone()))
-                    .ok_or_else(|| {
-                        e!(SpawnError::QuicSpawn, e!(QuicSpawnError::TlsNotConfigured))
-                    })?;
-                Some(
-                    QuicServer::spawn(quic_config.bind_addr, server_config, metrics.server.clone())
-                        .map_err(|err| e!(SpawnError::QuicSpawn, err))?,
-                )
-            }
-            None => None,
-        };
         let quic_addr = quic_server.as_ref().map(|srv| srv.bind_addr());
         let quic_handle = quic_server.as_ref().map(|srv| srv.handle());
 
-        let task = tokio::spawn(relay_supervisor(tasks, relay_server, quic_server));
+        let task = tokio::spawn(relay_supervisor(tasks, relay_server, quic_server, captive));
 
         Ok(Self {
             http_addr: http_addr.or(relay_addr),
@@ -976,6 +1013,24 @@ impl Server {
     }
 }
 
+// Captive owns connection descendants: signal it and observe its own result before
+// aborting the unrelated auxiliary tasks. A selected result has already consumed it.
+async fn drain_captive(
+    tasks: &mut JoinSet<Result<(), SupervisorError>>,
+    captive: Option<(tokio::task::Id, CancellationToken)>,
+) -> Option<Result<Result<(), SupervisorError>, JoinError>> {
+    let (id, cancel) = captive?;
+    cancel.cancel();
+    while let Some(result) = tasks.join_next_with_id().await {
+        match result {
+            Ok((finished, output)) if finished == id => return Some(Ok(output)),
+            Err(error) if error.id() == id => return Some(Err(error)),
+            _ => (),
+        }
+    }
+    None
+}
+
 /// Supervisor for the relay server tasks.
 ///
 /// As soon as one of the tasks exits, all other tasks are stopped and the server stops.
@@ -984,8 +1039,10 @@ impl Server {
 async fn relay_supervisor(
     mut tasks: JoinSet<Result<(), SupervisorError>>,
     mut relay_http_server: Option<http_server::Server>,
-    mut quic_server: Option<QuicServer>,
+    quic_server: Option<QuicServer>,
+    mut captive: Option<(tokio::task::Id, CancellationToken)>,
 ) -> Result<(), SupervisorError> {
+    let mut quic_server = quic_server;
     let quic_enabled = quic_server.is_some();
     let mut quic_fut = match quic_server {
         Some(ref mut server) => n0_future::Either::Left(server.task_handle()),
@@ -996,14 +1053,39 @@ async fn relay_supervisor(
         Some(ref mut server) => n0_future::Either::Left(server.task_handle()),
         None => n0_future::Either::Right(n0_future::future::pending()),
     };
-    let res = tokio::select! {
+    let mut http_consumed = false;
+    let mut res = tokio::select! {
         biased;
-        Some(ret) = tasks.join_next() => ret,
+        Some(ret) = tasks.join_next_with_id() => {
+            let id = match &ret { Ok((id, _)) => *id, Err(err) => err.id() };
+            if captive.as_ref().is_some_and(|(captive_id, _)| *captive_id == id) { captive = None; }
+            ret.map(|(_, output)| output)
+        },
         ret = &mut quic_fut, if quic_enabled => ret.map(Ok),
-        ret = &mut relay_fut, if relay_enabled => ret.map(Ok),
+        ret = &mut relay_fut, if relay_enabled => { http_consumed = true; ret.map(Ok) },
         else => Ok(Err(e!(SupervisorError::NoRelayServicesEnabled))),
     };
-    let ret = match res {
+
+    if let Some(server) = relay_http_server.as_mut() {
+        server.shutdown();
+        if !http_consumed {
+            let cleanup = server.task_handle().await.map(Ok);
+            if matches!(res, Ok(Ok(()))) {
+                res = cleanup;
+            }
+        }
+    }
+    if let Some(server) = quic_server {
+        server.shutdown().await;
+    }
+    if let Some(cleanup) = drain_captive(&mut tasks, captive).await
+        && matches!(res, Ok(Ok(())))
+    {
+        res = cleanup;
+    }
+    tasks.shutdown().await;
+
+    match res {
         Ok(Ok(())) => {
             debug!("Task exited");
             Ok(())
@@ -1020,23 +1102,7 @@ async fn relay_supervisor(
             debug!("Task cancelled");
             Err(e!(SupervisorError::TaskCancelled))
         }
-    };
-
-    // Ensure the HTTP server terminated, there is no harm in calling this after it is
-    // already shut down.
-    if let Some(server) = relay_http_server {
-        server.shutdown();
     }
-
-    // Ensure the QUIC server is closed
-    if let Some(server) = quic_server {
-        server.shutdown().await;
-    }
-
-    // Stop all remaining tasks
-    tasks.shutdown().await;
-
-    ret
 }
 
 fn root_handler(
@@ -1134,22 +1200,40 @@ fn healthz_handler(
         .map_err(|err| Box::new(err) as HyperError)
 }
 
-/// This is a future that never returns, drop it to cancel/abort.
-async fn run_captive_portal_service(http_listener: TcpListener) {
+#[cfg(test)]
+struct CaptiveConnectionDrop(Option<Arc<std::sync::atomic::AtomicBool>>);
+#[cfg(test)]
+impl Drop for CaptiveConnectionDrop {
+    fn drop(&mut self) {
+        if let Some(flag) = &self.0 {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Stops accepting on cancellation and awaits its native connection group.
+async fn run_captive_portal_service(
+    http_listener: TcpListener,
+    cancel: CancellationToken,
+    #[cfg(test)] connection_dropped: Option<Arc<std::sync::atomic::AtomicBool>>,
+) {
     info!("serving");
 
-    // If this future is cancelled, this is dropped and all tasks are aborted.
+    // Retain this future through cooperative cancellation to await descendants.
     let mut tasks = JoinSet::new();
+    let mut child_panic = None;
 
     loop {
         tokio::select! {
             biased;
 
+            _ = cancel.cancelled() => break,
             Some(res) = tasks.join_next() => {
                 if let Err(err) = res
                     && err.is_panic()
                 {
-                    panic!("task panicked: {err:#?}");
+                    child_panic = Some(err);
+                    break;
                 }
             }
 
@@ -1159,7 +1243,11 @@ async fn run_captive_portal_service(http_listener: TcpListener) {
                         debug!(%peer_addr, "Connection opened",);
                         let handler = CaptivePortalService;
 
+                        #[cfg(test)]
+                        let connection_dropped = connection_dropped.clone();
                         tasks.spawn(async move {
+                            #[cfg(test)]
+                            let _drop_witness = CaptiveConnectionDrop(connection_dropped);
                             let stream = crate::server::streams::MaybeTlsStream::Plain(stream);
                             let stream = hyper_util::rt::TokioIo::new(stream);
                             if let Err(err) = hyper::server::conn::http1::Builder::new()
@@ -1180,6 +1268,10 @@ async fn run_captive_portal_service(http_listener: TcpListener) {
                 }
             }
         }
+    }
+    tasks.shutdown().await;
+    if let Some(err) = child_panic {
+        panic!("task panicked: {err:#?}");
     }
 }
 
@@ -1921,5 +2013,449 @@ mod lifecycle_tests {
     #[tokio::test]
     async fn unobserved_outer_panic_direct_shutdown() {
         bounded(unobserved_outer_error_direct_shutdown(true)).await;
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use std::{
+        convert::Infallible,
+        future::Future,
+        net::Ipv4Addr,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        task::{Context, Poll},
+        time::Duration,
+    };
+
+    use bytes::Bytes;
+    use tokio::{
+        io::AsyncWriteExt,
+        net::TcpStream,
+        sync::{Notify, oneshot},
+        task::JoinSet,
+    };
+
+    use super::*;
+
+    async fn bounded(f: impl Future<Output = ()>) {
+        tokio::time::timeout(Duration::from_secs(10), f)
+            .await
+            .expect("whole cleanup scenario");
+    }
+
+    struct PendingBody {
+        entered: Arc<Notify>,
+        dropped: Arc<AtomicBool>,
+        root: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
+        root_finished: Arc<AtomicBool>,
+    }
+    impl hyper::body::Body for PendingBody {
+        type Data = Bytes;
+        type Error = Infallible;
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, Infallible>>> {
+            self.entered.notify_one();
+            Poll::Pending
+        }
+    }
+    impl Drop for PendingBody {
+        fn drop(&mut self) {
+            self.root_finished.store(
+                self.root.lock().unwrap().as_ref().unwrap().is_finished(),
+                Ordering::SeqCst,
+            );
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    async fn pending_http() -> (
+        http_server::Server,
+        TcpStream,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+    ) {
+        let entered = Arc::new(Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let root = Arc::new(std::sync::Mutex::new(None));
+        let root_finished = Arc::new(AtomicBool::new(false));
+        let (r, f) = (root.clone(), root_finished.clone());
+        let (e, d) = (entered.clone(), dropped.clone());
+        let mut server = http_server::ServerBuilder::new((Ipv4Addr::LOCALHOST, 0).into())
+            .request_handler(
+                Method::GET,
+                "/pending",
+                Box::new(move |_, response| {
+                    Ok(response
+                        .body(Box::new(PendingBody {
+                            entered: e.clone(),
+                            dropped: d.clone(),
+                            root: r.clone(),
+                            root_finished: f.clone(),
+                        }) as BytesBody)
+                        .unwrap())
+                }),
+            )
+            .request_handler(
+                Method::GET,
+                "/panic",
+                Box::new(|_, _| panic!("native connection panic")),
+            )
+            .spawn()
+            .await
+            .unwrap();
+        *root.lock().unwrap() = Some(server.task_handle().abort_handle());
+        let mut stream = TcpStream::connect(server.addr()).await.unwrap();
+        stream
+            .write_all(b"GET /pending HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        entered.notified().await;
+        (server, stream, dropped, root_finished)
+    }
+
+    struct CompletionWitness {
+        dropped: Arc<AtomicBool>,
+        observed: Arc<AtomicBool>,
+    }
+    impl Drop for CompletionWitness {
+        fn drop(&mut self) {
+            self.observed
+                .store(self.dropped.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
+    }
+    async fn supervisor_drains(mode: u8) {
+        bounded(async {
+            let (server, stream, dropped, _) = pending_http().await;
+            let mut tasks = JoinSet::new();
+            let (tx, rx) = oneshot::channel();
+            tasks.spawn(async move {
+                rx.await.unwrap();
+                match mode {
+                    0 => Ok(()),
+                    1 => Err(e!(SupervisorError::AcmeEventStreamFinished)),
+                    _ => panic!("primary auxiliary panic"),
+                }
+            });
+            let observed = Arc::new(AtomicBool::new(false));
+            let witness = CompletionWitness {
+                dropped: dropped.clone(),
+                observed: observed.clone(),
+            };
+            let supervisor = tokio::spawn(async move {
+                let _witness = witness;
+                relay_supervisor(tasks, Some(server), None, None).await
+            });
+            tx.send(()).unwrap();
+            let outcome = supervisor.await;
+            let drained_at_completion = observed.load(Ordering::SeqCst);
+            // Old abort-on-drop ownership must also finish before the baseline assertion.
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            drop(stream);
+            match mode {
+                0 => assert!(outcome.unwrap().is_ok()),
+                1 => assert!(outcome.unwrap().is_err()),
+                _ => assert!(outcome.unwrap_err().is_panic()),
+            }
+            assert!(
+                drained_at_completion,
+                "native HTTP body still alive when supervisor completed"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervisor_success_drains_http() {
+        supervisor_drains(0).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervisor_error_drains_http() {
+        supervisor_drains(1).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervisor_panic_drains_http() {
+        supervisor_drains(2).await;
+    }
+
+    async fn failed_start(later_bind: bool) {
+        bounded(async {
+            let reserve = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let addr = reserve.local_addr().unwrap();
+            drop(reserve);
+            let metrics_reserve = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let metrics_addr = metrics_reserve.local_addr().unwrap();
+            drop(metrics_reserve);
+            let occupied = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let mut quic = QuicConfig::new(occupied.local_addr().unwrap());
+            if later_bind {
+                let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+                quic.server_config = Some(rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                    .with_safe_default_protocol_versions().unwrap().with_no_client_auth()
+                    .with_single_cert(vec![cert.cert.der().clone()], rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into()).unwrap());
+            }
+            let result = Server::spawn(ServerConfig { relay: Some(RelayConfig::new(addr)), quic: Some(quic), metrics_addr: Some(metrics_addr), ..Default::default() }).await;
+            match result.unwrap_err() {
+                SpawnError::QuicSpawn { source, .. } => {
+                    if later_bind { assert!(matches!(source, QuicSpawnError::EndpointServer { .. })); }
+                    else { assert!(matches!(source, QuicSpawnError::TlsNotConfigured { .. })); }
+                }
+                error => panic!("unexpected startup error: {error:#}"),
+            }
+            let relay_released = std::net::TcpListener::bind(addr).is_ok();
+            let metrics_released = std::net::TcpListener::bind(metrics_addr).is_ok();
+            // Finish scheduled aborts before asserting the captured failure witness.
+            loop {
+                if let (Ok(a), Ok(b)) = (std::net::TcpListener::bind(addr), std::net::TcpListener::bind(metrics_addr)) { drop((a,b)); break; }
+                tokio::task::yield_now().await;
+            }
+            assert!(relay_released && metrics_released, "failed start returned before created listeners were released: relay={relay_released} metrics={metrics_released}");
+        }).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_start_missing_qad_tls_drains() {
+        failed_start(false).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_start_qad_bind_drains() {
+        failed_start(true).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_child_panic_drains_other_connection() {
+        bounded(async {
+            let (mut server, live, dropped, root_finished) = pending_http().await;
+            let mut trigger = TcpStream::connect(server.addr()).await.unwrap();
+            trigger
+                .write_all(b"GET /panic HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await
+                .unwrap();
+            let error = server.task_handle().await.unwrap_err();
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            drop((live, trigger));
+            assert!(error.is_panic());
+            assert!(
+                !root_finished.load(Ordering::SeqCst),
+                "HTTP root finished before live connection destruction"
+            );
+        })
+        .await;
+    }
+
+    struct CaptiveCompletion {
+        descendant_dropped: Arc<AtomicBool>,
+        closed: Arc<AtomicBool>,
+    }
+    impl Drop for CaptiveCompletion {
+        fn drop(&mut self) {
+            self.closed.store(
+                self.descendant_dropped.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn captive_completion_drains_live_connection() {
+        bounded(async {
+            use tokio::io::AsyncReadExt;
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let addr = listener.local_addr().unwrap();
+            let descendant_dropped = Arc::new(AtomicBool::new(false));
+            let connection_dropped = descendant_dropped.clone();
+            let closed = Arc::new(AtomicBool::new(false));
+            let witness = CaptiveCompletion {
+                descendant_dropped,
+                closed: closed.clone(),
+            };
+            let cancel = CancellationToken::new();
+            let stop = cancel.clone();
+            let task = tokio::spawn(async move {
+                let _witness = witness;
+                run_captive_portal_service(listener, stop, Some(connection_dropped)).await;
+            });
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(b"GET /generate_204 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = [0; 1024];
+            let n = stream.read(&mut response).await.unwrap();
+            assert!(response[..n].starts_with(b"HTTP/1.1 204"));
+            stream
+                .write_all(b"GET /generate_204 HTTP/1.1\r\nHost:")
+                .await
+                .unwrap();
+            let stream = Arc::new(stream);
+            cancel.cancel();
+            task.await.unwrap();
+            let closed_at_completion = closed.load(Ordering::SeqCst);
+            loop {
+                match stream.try_read(&mut [0; 1024]) {
+                    Ok(0) => break,
+                    Ok(_) => (),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        tokio::task::yield_now().await
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
+                    Err(e) => panic!("captive fixture read: {e}"),
+                }
+            }
+            assert!(
+                closed_at_completion,
+                "captive parent completed before accepted connection future destruction"
+            );
+        })
+        .await;
+    }
+
+    async fn completed_http_result(primary_error: bool, auxiliary: bool) {
+        bounded(async {
+            let (mut server, live, dropped, _) = pending_http().await;
+            let mut trigger = TcpStream::connect(server.addr()).await.unwrap();
+            trigger
+                .write_all(b"GET /panic HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await
+                .unwrap();
+            while !server.task_handle().is_finished() {
+                tokio::task::yield_now().await;
+            }
+            let mut tasks = JoinSet::new();
+            if auxiliary {
+                let task = tasks.spawn(async move {
+                    if primary_error {
+                        Err(e!(SupervisorError::AcmeEventStreamFinished))
+                    } else {
+                        Ok(())
+                    }
+                });
+                while !task.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            }
+            let result = tokio::spawn(relay_supervisor(tasks, Some(server), None, None)).await;
+            assert!(dropped.load(Ordering::SeqCst));
+            drop((live, trigger));
+            if primary_error {
+                assert!(matches!(
+                    result.unwrap(),
+                    Err(SupervisorError::AcmeEventStreamFinished { .. })
+                ));
+            } else {
+                let panic = result.unwrap_err().into_panic();
+                let message = panic
+                    .downcast_ref::<String>()
+                    .expect("formatted native child panic");
+                assert!(
+                    message.contains("task panicked:")
+                        && message.contains("native connection panic")
+                );
+            }
+        })
+        .await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn selected_http_result_is_consumed_once() {
+        completed_http_result(false, false).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_auxiliary_preserves_http_cleanup_panic() {
+        completed_http_result(false, true).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn primary_error_precedes_http_cleanup_panic() {
+        completed_http_result(true, true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervisor_drains_actual_captive_before_auxiliary_abort() {
+        bounded(async {
+            use tokio::io::AsyncReadExt;
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let addr = listener.local_addr().unwrap();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let flag = dropped.clone();
+            let cancel = CancellationToken::new();
+            let stop = cancel.clone();
+            let mut tasks = JoinSet::new();
+            let id = tasks
+                .spawn(async move {
+                    run_captive_portal_service(listener, stop, Some(flag)).await;
+                    Ok(())
+                })
+                .id();
+            let mut peer = TcpStream::connect(addr).await.unwrap();
+            peer.write_all(b"GET /generate_204 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = [0; 1024];
+            assert!(peer.read(&mut response).await.unwrap() > 0);
+            let (server, live, http_dropped, _) = pending_http().await;
+            tasks.spawn(async { Err(e!(SupervisorError::AcmeEventStreamFinished)) });
+            let result = relay_supervisor(tasks, Some(server), None, Some((id, cancel))).await;
+            assert!(matches!(
+                result,
+                Err(SupervisorError::AcmeEventStreamFinished { .. })
+            ));
+            assert!(dropped.load(Ordering::SeqCst));
+            assert!(http_dropped.load(Ordering::SeqCst));
+            drop((peer, live));
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_start_https_bind_drains_captive_and_metrics() {
+        bounded(async {
+            let reserve = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let http = reserve.local_addr().unwrap();
+            drop(reserve);
+            let reserve = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let metrics = reserve.local_addr().unwrap();
+            drop(reserve);
+            let occupied = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let https = occupied.local_addr().unwrap();
+            let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+            let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
+                    .into(),
+            )
+            .unwrap();
+            let mut relay = RelayConfig::new(http);
+            relay.tls = Some(TlsConfig::new(https, CertConfig::Manual { server_config }));
+            let error = Server::spawn(ServerConfig {
+                relay: Some(relay),
+                metrics_addr: Some(metrics),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+            assert!(matches!(error, SpawnError::BindTcpListener { addr, .. } if addr == https));
+            // Native captive and metrics listeners must already be gone before yielding.
+            let plain =
+                std::net::TcpListener::bind(http).expect("captive startup listener drained");
+            let metrics =
+                std::net::TcpListener::bind(metrics).expect("metrics startup listener drained");
+            drop((plain, metrics, occupied));
+        })
+        .await;
     }
 }
