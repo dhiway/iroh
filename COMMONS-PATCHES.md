@@ -61,3 +61,15 @@ then propagate the result; terminal join is not repeatable. Native admission,
 wire/configuration, supervisor and public signatures remain unchanged. The
 binary's discarded join result remains a separately owned caller correction;
 this is not host integration, publication or qualification evidence.
+
+T268.130 corrects the relay binary caller separately from T268.129's library
+ownership repair. The actual no-services executable previously exited zero after
+logging its native supervisor failure. The caller now retains the nested join
+result, awaits one consuming shutdown future and propagates the original failure
+before any cleanup error. Without an observed result, cleanup errors propagate.
+Native Ctrl-C wildcard handling and branch bias are unchanged. Controlled pending
+cleanup tests cover inner failure, outer cancellation/panic, success and cleanup
+failure; bounded executable tests cover native no-services failure and healthy
+loopback serving followed by owned-PID SIGINT. Process exit/listener release
+supplement, rather than prove, awaited cleanup. No public API, dependencies,
+configuration, wire behavior, host integration or qualification changes.

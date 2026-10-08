@@ -165,8 +165,11 @@ task has already finished, but does not replay a result already delivered by
 `join`. Successful cleanup therefore does not erase an observed error. A timeout
 or dropped shutdown future is not evidence of completed cleanup.
 
-This library contract does not establish binary failure reporting: the current
-binary caller discards its `join` result and needs a separate caller correction.
+The binary retains a completed join result, awaits shutdown, then propagates the
+original outer or inner failure before any cleanup failure. Without an observed
+join result, it propagates shutdown's result. Ordinary Ctrl-C shutdown and native
+successful completion remain successful. The existing biased Ctrl-C selection,
+including signal-registration error behavior, is unchanged.
 No chain authority, host deployment or release qualification is supplied here.
 
 # License

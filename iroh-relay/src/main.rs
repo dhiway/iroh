@@ -602,13 +602,31 @@ async fn main() -> Result<()> {
 
     let mut relay = relay::Server::spawn(relay_config).await?;
 
-    tokio::select! {
+    let observed = tokio::select! {
         biased;
-        _ = tokio::signal::ctrl_c() => (),
-        _ = relay.join() => (),
-    }
+        _ = tokio::signal::ctrl_c() => None,
+        result = relay.join() => Some(result),
+    };
 
-    relay.shutdown().await?;
+    finish_shutdown(observed, relay.shutdown()).await
+}
+
+// Await the one consuming cleanup future before returning either observed error level.
+// A previously delivered supervisor error takes precedence over a cleanup error.
+async fn finish_shutdown(
+    observed: Option<
+        std::result::Result<
+            std::result::Result<(), relay::SupervisorError>,
+            tokio::task::JoinError,
+        >,
+    >,
+    shutdown: impl std::future::Future<Output = std::result::Result<(), relay::SupervisorError>>,
+) -> Result<()> {
+    let cleanup = shutdown.await;
+    if let Some(observed) = observed {
+        observed.std_context("relay supervisor task")??;
+    }
+    cleanup?;
     Ok(())
 }
 
@@ -955,5 +973,147 @@ mod tests {
         assert!(relay_config.relay.is_some());
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use std::{
+        future::{Future, poll_fn},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        task::Poll,
+        time::Duration,
+    };
+
+    use n0_error::e;
+
+    use super::{finish_shutdown, relay};
+
+    async fn bounded(future: impl Future<Output = ()>) {
+        tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .expect("whole completion scenario timeout");
+    }
+
+    async fn assert_cleanup_order(
+        observed: Option<Result<Result<(), relay::SupervisorError>, tokio::task::JoinError>>,
+        cleanup: Result<(), relay::SupervisorError>,
+        expected: Option<&str>,
+    ) {
+        let (release, pending) = tokio::sync::oneshot::channel();
+        let entered = Arc::new(AtomicBool::new(false));
+        let complete = Arc::new(AtomicBool::new(false));
+        let entered_cleanup = entered.clone();
+        let complete_cleanup = complete.clone();
+        let mut result = Box::pin(finish_shutdown(observed, async move {
+            entered_cleanup.store(true, Ordering::SeqCst);
+            pending.await.unwrap();
+            complete_cleanup.store(true, Ordering::SeqCst);
+            cleanup
+        }));
+        poll_fn(|cx| {
+            assert!(
+                result.as_mut().poll(cx).is_pending(),
+                "must await pending cleanup before any result"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        assert!(entered.load(Ordering::SeqCst));
+        assert!(!complete.load(Ordering::SeqCst));
+        release.send(()).unwrap();
+        let result = result.await;
+        assert!(complete.load(Ordering::SeqCst));
+        match expected {
+            None => result.unwrap(),
+            Some(expected) => {
+                let error = format!(
+                    "{:?}",
+                    result.expect_err("expected original or cleanup failure")
+                );
+                assert!(error.contains(expected), "expected {expected}: {error}");
+                if expected != "Acme event stream finished" {
+                    assert!(
+                        !error.contains("Acme event stream finished"),
+                        "original failure has precedence: {error}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn cleanup_error() -> Result<(), relay::SupervisorError> {
+        Err(e!(relay::SupervisorError::AcmeEventStreamFinished))
+    }
+
+    #[tokio::test]
+    async fn inner_error_awaits_cleanup_and_has_precedence() {
+        bounded(assert_cleanup_order(
+            Some(Ok(Err(e!(relay::SupervisorError::NoRelayServicesEnabled)))),
+            cleanup_error(),
+            Some("No relay services are enabled"),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn outer_cancel_awaits_cleanup_and_has_precedence() {
+        bounded(async {
+            let task = tokio::spawn(std::future::pending::<Result<(), relay::SupervisorError>>());
+            task.abort();
+            let observed = task.await;
+            assert!(observed.as_ref().unwrap_err().is_cancelled());
+            assert_cleanup_order(Some(observed), cleanup_error(), Some("cancelled")).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn outer_panic_awaits_cleanup_and_has_precedence() {
+        bounded(async {
+            let task: tokio::task::JoinHandle<Result<(), relay::SupervisorError>> =
+                tokio::spawn(async { panic!("controlled supervisor panic") });
+            let observed = task.await;
+            assert!(observed.as_ref().unwrap_err().is_panic());
+            assert_cleanup_order(
+                Some(observed),
+                cleanup_error(),
+                Some("controlled supervisor panic"),
+            )
+            .await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn successful_join_still_propagates_cleanup_error() {
+        bounded(assert_cleanup_order(
+            Some(Ok(Ok(()))),
+            cleanup_error(),
+            Some("Acme event stream finished"),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn no_observed_join_propagates_cleanup_error() {
+        bounded(assert_cleanup_order(
+            None,
+            cleanup_error(),
+            Some("Acme event stream finished"),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn successful_paths_await_cleanup() {
+        bounded(async {
+            assert_cleanup_order(Some(Ok(Ok(()))), Ok(()), None).await;
+            assert_cleanup_order(None, Ok(()), None).await;
+        })
+        .await;
     }
 }
