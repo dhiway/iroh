@@ -110,6 +110,7 @@ pub(super) struct SocketState {
     pub(super) dns_resolver: DnsResolver,
     /// The proxy to send the HTTP(S) based probes through, if any.
     pub(super) proxy_url: Option<Url>,
+    pub(super) direct_http: bool,
 }
 
 impl Client {
@@ -294,6 +295,7 @@ impl Actor {
 
             let dns_resolver = self.socket_state.dns_resolver.clone();
             let proxy_url = self.socket_state.proxy_url.clone();
+            let direct_http = self.socket_state.direct_http;
             let dm = self.relay_map.clone();
             let token = token.clone();
             #[cfg(not(wasm_browser))]
@@ -312,6 +314,7 @@ impl Actor {
                                     preferred_relay,
                                     tls_config,
                                     proxy_url.as_ref(),
+                                    direct_http,
                                 ),
                             )
                             .await
@@ -529,6 +532,8 @@ impl Probe {
                     tls_config,
                     #[cfg(not(wasm_browser))]
                     socket_state.proxy_url.as_ref(),
+                    #[cfg(not(wasm_browser))]
+                    socket_state.direct_http,
                 )
                 .await
                 {
@@ -577,6 +582,7 @@ async fn check_captive_portal(
     preferred_relay: Option<RelayUrl>,
     tls_config: rustls::ClientConfig,
     proxy_url: Option<&Url>,
+    direct_http: bool,
 ) -> Result<bool, CaptivePortalError> {
     // If we have a preferred relay and we can use it for non-QAD requests, try that;
     // otherwise, pick a random one suitable for non-STUN requests.
@@ -601,7 +607,10 @@ async fn check_captive_portal(
 
     let mut builder = reqwest_client_builder(tls_config, dns_resolver.clone())
         .redirect(reqwest::redirect::Policy::none());
-    if let Some(proxy_url) = proxy_url {
+    if direct_http {
+        builder = builder.no_proxy();
+    }
+    if let Some(proxy_url) = proxy_url.filter(|_| !direct_http) {
         let proxy = reqwest::Proxy::all(proxy_url.clone())
             .map_err(|err| e!(CaptivePortalError::CreateReqwestClient, err))?;
         builder = builder.proxy(proxy);
@@ -816,6 +825,7 @@ async fn run_https_probe(
     relay: RelayUrl,
     #[cfg(not(wasm_browser))] tls_config: rustls::ClientConfig,
     #[cfg(not(wasm_browser))] proxy_url: Option<&Url>,
+    #[cfg(not(wasm_browser))] direct_http: bool,
 ) -> Result<HttpsProbeReport, MeasureHttpsLatencyError> {
     trace!("HTTPS probe start");
     let url = relay.join(RELAY_PROBE_PATH)?;
@@ -830,7 +840,11 @@ async fn run_https_probe(
     let builder = reqwest_client_builder();
 
     #[cfg(not(wasm_browser))]
-    if let Some(proxy_url) = proxy_url {
+    if direct_http {
+        builder = builder.no_proxy();
+    }
+    #[cfg(not(wasm_browser))]
+    if let Some(proxy_url) = proxy_url.filter(|_| !direct_http) {
         let proxy = reqwest::Proxy::all(proxy_url.clone())
             .map_err(|err| e!(MeasureHttpsLatencyError::CreateReqwestClient, err))?;
         builder = builder.proxy(proxy);
@@ -881,6 +895,37 @@ mod tests {
     use super::{super::test_utils, *};
 
     #[tokio::test]
+    async fn strict_relays_https_probe_bypasses_proxy() {
+        let (server, relay) = test_utils::relay().await;
+        let trap = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy: Url = format!("http://{}/", trap.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let report = time::timeout(
+            Duration::from_secs(5),
+            run_https_probe(
+                &DnsResolver::new(),
+                relay.url.clone(),
+                CaTlsConfig::insecure_skip_verify()
+                    .client_config(default_provider())
+                    .unwrap(),
+                Some(&proxy),
+                true,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.relay, relay.url);
+        assert!(
+            time::timeout(Duration::from_millis(100), trap.accept())
+                .await
+                .is_err()
+        );
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_measure_https_latency() -> Result {
         let (_server, relay) = test_utils::relay().await;
         let dns_resolver = DnsResolver::new();
@@ -892,6 +937,7 @@ mod tests {
                 .client_config(default_provider())
                 .expect("infallible"),
             None,
+            false,
         )
         .await?;
 
@@ -952,6 +998,7 @@ mod tests {
                 .client_config(default_provider())
                 .expect("infallible"),
             Some(&proxy_url),
+            false,
         )
         .await;
         assert!(

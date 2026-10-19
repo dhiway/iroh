@@ -946,6 +946,7 @@ pub(crate) struct Config {
     /// Per-relay configuration. Consulted when starting a connection to
     /// look up the auth token and any future per-relay options.
     pub relay_map: RelayMap,
+    pub relay_allowlist: crate::endpoint::RelayAllowlist,
 }
 
 /// Connection state of the home relay.
@@ -1210,7 +1211,7 @@ impl RelayActor {
         let url = item.url.clone();
         let handle = self
             .active_relay_handle_for_endpoint(&item.url, &item.remote_endpoint)
-            .await;
+            .await?;
         match handle.datagrams_send_queue.try_send(item) {
             Ok(()) => None,
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -1238,6 +1239,9 @@ impl RelayActor {
         }
 
         if let Some(relay_url) = report.preferred_relay {
+            if !self.config.relay_allowlist.allows(&relay_url) {
+                return;
+            }
             self.config.metrics.relay_home_change.inc();
 
             // On change, notify all currently connected relay servers and
@@ -1257,6 +1261,9 @@ impl RelayActor {
     }
 
     async fn set_home_relay(&mut self, home_url: RelayUrl) {
+        if !self.config.relay_allowlist.allows(&home_url) {
+            return;
+        }
         let home_url_ref = &home_url;
         n0_future::join_all(self.active_relays.iter().map(|(url, handle)| async move {
             let is_preferred = url == home_url_ref;
@@ -1268,7 +1275,7 @@ impl RelayActor {
         }))
         .await;
         // Ensure we have an ActiveRelayActor for the current home relay.
-        self.active_relay_handle(home_url);
+        let _ = self.active_relay_handle(home_url);
     }
 
     /// Returns the handle for the [`ActiveRelayActor`] to reach `remote_endpoint`.
@@ -1280,9 +1287,12 @@ impl RelayActor {
         &mut self,
         url: &RelayUrl,
         remote_endpoint: &EndpointId,
-    ) -> ActiveRelayHandle {
+    ) -> Option<ActiveRelayHandle> {
+        if !self.config.relay_allowlist.allows(url) {
+            return None;
+        }
         if let Some(handle) = self.active_relays.get(url) {
-            return handle.clone();
+            return Some(handle.clone());
         }
 
         let mut found_relay: Option<RelayUrl> = None;
@@ -1319,11 +1329,14 @@ impl RelayActor {
     }
 
     /// Returns the handle of the [`ActiveRelayActor`].
-    fn active_relay_handle(&mut self, url: RelayUrl) -> ActiveRelayHandle {
-        match self.active_relays.get(&url) {
+    fn active_relay_handle(&mut self, url: RelayUrl) -> Option<ActiveRelayHandle> {
+        if !self.config.relay_allowlist.allows(&url) {
+            return None;
+        }
+        Some(match self.active_relays.get(&url) {
             Some(e) => e.clone(),
             None => {
-                let handle = self.start_active_relay(url.clone());
+                let handle = self.start_active_relay(url.clone())?;
                 if Some(&url) == self.config.my_relay.get().as_ref().map(RelayStatus::url)
                     && let Err(err) = handle
                         .inbox_addr
@@ -1335,10 +1348,13 @@ impl RelayActor {
                 self.log_active_relay();
                 handle
             }
-        }
+        })
     }
 
-    fn start_active_relay(&mut self, url: RelayUrl) -> ActiveRelayHandle {
+    fn start_active_relay(&mut self, url: RelayUrl) -> Option<ActiveRelayHandle> {
+        if !self.config.relay_allowlist.allows(&url) {
+            return None;
+        }
         debug!(?url, "Adding relay connection");
 
         let auth_token = self
@@ -1385,7 +1401,7 @@ impl RelayActor {
             datagrams_send_queue: send_datagram_tx,
         };
         self.log_active_relay();
-        handle
+        Some(handle)
     }
 
     /// Triggers an immediate health check on all relay connections after a network change.
@@ -1439,7 +1455,7 @@ impl RelayActor {
 
         // Make sure home relay exists
         if let Some(status) = self.config.my_relay.get() {
-            self.active_relay_handle(status.url().clone());
+            let _ = self.active_relay_handle(status.url().clone());
         }
         self.log_active_relay();
     }
@@ -1548,6 +1564,7 @@ mod tests {
                 .expect("infallible"),
             metrics: Default::default(),
             relay_map: RelayMap::empty(),
+            relay_allowlist: Default::default(),
         };
         let mut actor =
             RelayActor::new(config, relay_datagram_recv_queue, CancellationToken::new());
@@ -1560,6 +1577,109 @@ mod tests {
 
         assert!(actor.active_relay_tasks.is_empty());
         assert!(logs_contain("ActiveRelayActor cancelled"));
+    }
+
+    #[derive(Debug, Clone)]
+    struct StrictDnsTrap(Arc<std::sync::atomic::AtomicUsize>);
+    impl iroh_dns::dns::Resolver for StrictDnsTrap {
+        fn lookup_ipv4(
+            &self,
+            _: String,
+        ) -> n0_future::boxed::BoxFuture<
+            std::result::Result<
+                iroh_dns::dns::BoxIter<std::net::Ipv4Addr>,
+                iroh_dns::dns::DnsError,
+            >,
+        > {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Ok(Box::new(std::iter::empty()) as iroh_dns::dns::BoxIter<std::net::Ipv4Addr>)
+            })
+        }
+        fn lookup_ipv6(
+            &self,
+            _: String,
+        ) -> n0_future::boxed::BoxFuture<
+            std::result::Result<
+                iroh_dns::dns::BoxIter<std::net::Ipv6Addr>,
+                iroh_dns::dns::DnsError,
+            >,
+        > {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Ok(Box::new(std::iter::empty()) as iroh_dns::dns::BoxIter<std::net::Ipv6Addr>)
+            })
+        }
+        fn lookup_txt(
+            &self,
+            _: String,
+        ) -> n0_future::boxed::BoxFuture<
+            std::result::Result<
+                iroh_dns::dns::BoxIter<iroh_dns::dns::TxtRecordData>,
+                iroh_dns::dns::DnsError,
+            >,
+        > {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Ok(Box::new(std::iter::empty())
+                    as iroh_dns::dns::BoxIter<iroh_dns::dns::TxtRecordData>)
+            })
+        }
+        fn clear_cache(&self) {}
+        fn reset(&self) -> Box<dyn iroh_dns::dns::Resolver> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_relays_actor_rejects_queued_home_and_reconnect_paths() {
+        let queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, _rx) = mpsc::channel(1);
+        let mut policy = crate::endpoint::RelayAllowlist::default();
+        policy.restrict([]);
+        let mut actor = RelayActor::new(
+            Config {
+                my_relay: Default::default(),
+                secret_key: SecretKey::generate(),
+                dns_resolver: DnsResolver::custom(StrictDnsTrap(queries.clone())),
+                proxy_url: None,
+                ipv6_reported: Arc::new(AtomicBool::new(false)),
+                tls_config: CaTlsConfig::default()
+                    .client_config(default_provider())
+                    .unwrap(),
+                metrics: Default::default(),
+                relay_map: RelayMap::empty(),
+                relay_allowlist: policy,
+            },
+            tx,
+            CancellationToken::new(),
+        );
+        let foreign: RelayUrl = "https://forbidden.invalid/".parse().unwrap();
+        assert!(actor.active_relay_handle(foreign.clone()).is_none());
+        let item = RelaySendItem {
+            url: foreign.clone(),
+            remote_endpoint: SecretKey::generate().public(),
+            datagrams: Datagrams {
+                contents: bytes::Bytes::from_static(b"queued"),
+                segment_size: None,
+                ecn: None,
+            },
+        };
+        assert!(actor.try_send_datagram(item).await.is_none());
+        actor
+            .on_network_change(crate::net_report::Report {
+                preferred_relay: Some(foreign.clone()),
+                ..Default::default()
+            })
+            .await;
+        actor.set_home_relay(foreign).await;
+        actor.check_connection_after_network_change().await;
+        actor.reap_active_relays();
+        assert!(actor.config.my_relay.get().is_none());
+        assert!(actor.active_relays.is_empty());
+        assert!(actor.active_relay_tasks.is_empty());
+        actor.close_all_active_relays().await;
+        assert_eq!(queries.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// Starts a new [`ActiveRelayActor`].

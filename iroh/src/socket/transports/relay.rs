@@ -41,6 +41,7 @@ pub(crate) struct RelayTransport {
     _actor_handle: AbortOnDropHandle<()>,
     my_relay: HomeRelayWatch,
     my_endpoint_id: EndpointId,
+    relay_allowlist: crate::endpoint::RelayAllowlist,
 }
 
 impl std::fmt::Display for RelayTransport {
@@ -57,6 +58,7 @@ impl RelayTransport {
 
         let (actor_sender, actor_receiver) = mpsc::channel(256);
 
+        let relay_allowlist = config.relay_allowlist.clone();
         let my_endpoint_id = config.secret_key.public();
         let my_relay = config.my_relay.clone();
 
@@ -79,12 +81,14 @@ impl RelayTransport {
             _actor_handle: actor_handle,
             my_relay,
             my_endpoint_id,
+            relay_allowlist,
         }
     }
 
     pub(crate) fn create_sender(&self) -> RelaySender {
         RelaySender {
             sender: PollSender::new(self.relay_datagram_send_channel.clone()),
+            relay_allowlist: self.relay_allowlist.clone(),
         }
     }
 
@@ -101,6 +105,7 @@ impl RelayTransport {
             recv_infos.len(),
             "non matching bufs & recv_infos"
         );
+        let relay_allowlist = self.relay_allowlist.clone();
         let mut num_msgs = 0;
         for i in 0..bufs.len() {
             let buf_out = &mut bufs[i];
@@ -120,6 +125,10 @@ impl RelayTransport {
                 }
             };
 
+            if !relay_allowlist.allows(&dm.url) {
+                self.pending_item = None;
+                continue;
+            }
             // This *tries* to make the datagrams fit into our buffer by re-batching them.
             let num_segments = dm
                 .datagrams
@@ -276,11 +285,12 @@ impl RelayNetworkChangeSender {
 #[derive(Debug, Clone)]
 pub(crate) struct RelaySender {
     sender: PollSender<RelaySendItem>,
+    relay_allowlist: crate::endpoint::RelayAllowlist,
 }
 
 impl RelaySender {
-    pub(super) fn is_valid_send_addr(&self, _url: &RelayUrl, _endpoint_id: &EndpointId) -> bool {
-        true
+    pub(super) fn is_valid_send_addr(&self, url: &RelayUrl, _endpoint_id: &EndpointId) -> bool {
+        self.relay_allowlist.allows(url)
     }
 
     pub(super) fn poll_send(
@@ -290,6 +300,9 @@ impl RelaySender {
         dest_endpoint: EndpointId,
         transmit: &Transmit<'_>,
     ) -> Poll<io::Result<()>> {
+        if !self.relay_allowlist.allows(&dest_url) {
+            return Poll::Ready(Ok(()));
+        }
         match ready!(self.sender.poll_reserve(cx)) {
             Ok(()) => {
                 let contents = datagrams_from_transmit(transmit);
@@ -358,6 +371,7 @@ mod tests {
             (
                 RelaySender {
                     sender: PollSender::new(sender),
+                    relay_allowlist: Default::default(),
                 },
                 receiver,
             )
@@ -427,8 +441,55 @@ mod tests {
                 .expect("infallible"),
             metrics: Default::default(),
             relay_map: RelayMap::empty(),
+            relay_allowlist: Default::default(),
         };
         RelayTransport::new(config, CancellationToken::new())
+    }
+
+    #[tokio::test]
+    async fn strict_relays_sender_and_receive_reject_unapproved_metadata() {
+        let mut transport = test_relay_transport();
+        transport.relay_allowlist.restrict([]);
+        let url: RelayUrl = "https://forbidden.invalid/".parse().unwrap();
+        let peer = SecretKey::generate().public();
+        let mut sender = transport.create_sender();
+        assert!(!sender.is_valid_send_addr(&url, &peer));
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(
+            sender
+                .poll_send(
+                    &mut cx,
+                    url.clone(),
+                    peer,
+                    &Transmit {
+                        ecn: None,
+                        contents: b"denied",
+                        segment_size: None,
+                    }
+                )
+                .is_ready()
+        );
+        transport.pending_item = Some(RelayRecvDatagram {
+            url,
+            src: peer,
+            datagrams: Datagrams {
+                contents: Bytes::from_static(b"denied"),
+                segment_size: None,
+                ecn: None,
+            },
+        });
+        let mut data = [0u8; 128];
+        let mut bufs = [io::IoSliceMut::new(&mut data)];
+        let mut metas = [noq_udp::RecvMeta::default()];
+        let mut infos = [RecvInfo::from_addr(
+            ("https://unused.invalid/".parse::<RelayUrl>().unwrap(), peer).into(),
+        )];
+        assert!(
+            transport
+                .poll_recv(&mut cx, &mut bufs, &mut metas, &mut infos)
+                .is_pending()
+        );
+        assert!(transport.pending_item.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]

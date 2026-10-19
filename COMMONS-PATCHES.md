@@ -91,3 +91,34 @@ drains and QAD descendants are outside stronger completion claims. Private tests
 exercise actual local native builders/loops, pending bodies and authorization,
 startup failures, panic precedence, closure/registration races and owner drop.
 No public signature, dependency, wire format, host policy or qualification changes.
+
+
+## T268.200 — immutable native relay policy and direct Pkarr HTTP
+
+`endpoint::Builder::relay_allowlist` installs a monotonic, endpoint-owned set of
+exact native relay URLs; repeated installation intersects sets, and applying a
+preset cannot erase an existing restriction. No policy retains upstream behavior;
+an empty policy retains direct IP transport with no relay traffic. Restricted
+bind checks actual copied relay configs, detaches the candidate map from external
+aliases, and refuses explicit proxy settings before endpoint/network effects.
+Runtime insertions, native relay send queues, actor creation/home selection and
+received relay metadata enforce the same immutable set. Native network reports
+use one detached checked map for delayed HTTP probes and QAD; retained QAD
+connections outside that view are discarded. Restricted HTTP probes ignore
+ambient proxies. This is a relay/service policy, not a classifier of arbitrary
+direct-peer IP ownership, and it introduces no custom transport or wire changes.
+
+Native `address_lookup::PkarrRelayClient::new_direct` retains TLS and native
+requested-key packet validation while disabling redirects and ambient proxies
+for GET and PUT. It normalizes a trailing base-URL slash before appending the
+endpoint key. Native `PkarrResolver::cmns_builder` uses this direct client;
+ordinary constructors and browser behavior remain unchanged. The direct
+constructor is intentionally native-only; browser proxy/redirect enforcement is
+not claimed. A staging publisher is not enabled by either API.
+
+Focused tests exercise monotonic preset ordering, copied-map aliasing and
+mismatched configs, initial/runtime refusal, native queued/home/receive paths,
+report/QAD filtering, IPv4/IPv6 direct bytes and approved relay bytes. HTTP
+redirect/proxy traps include ordinary-client positive controls; environment
+changes occur only in a bounded subprocess. Qualification and consumer adoption
+remain separate from these native source changes.

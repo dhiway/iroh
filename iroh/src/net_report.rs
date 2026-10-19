@@ -140,6 +140,7 @@ pub(crate) struct Client {
     metrics: Arc<Metrics>,
     probes: BTreeSet<Probe>,
     relay_map: RelayMap,
+    relay_allowlist: crate::endpoint::RelayAllowlist,
     #[cfg(not(wasm_browser))]
     qad_conns: QadConns,
     #[cfg(not(wasm_browser))]
@@ -254,6 +255,15 @@ impl Default for Reports {
 }
 
 impl Client {
+    pub(crate) fn with_relay_allowlist(mut self, policy: crate::endpoint::RelayAllowlist) -> Self {
+        #[cfg(not(wasm_browser))]
+        {
+            self.socket_state.direct_http = policy.restricted();
+        }
+        self.relay_allowlist = policy;
+        self
+    }
+
     /// Creates a new net_report client.
     pub(crate) fn new(
         #[cfg(not(wasm_browser))] dns_resolver: DnsResolver,
@@ -273,6 +283,7 @@ impl Client {
             quic_client,
             dns_resolver,
             proxy_url: opts.proxy_url,
+            direct_http: false,
         };
 
         Client {
@@ -282,6 +293,7 @@ impl Client {
             reports: Reports::default(),
             probes,
             relay_map,
+            relay_allowlist: Default::default(),
             #[cfg(not(wasm_browser))]
             qad_conns: QadConns::default(),
             #[cfg(not(wasm_browser))]
@@ -325,7 +337,9 @@ impl Client {
         }
         self.metrics.reports.inc();
 
-        let num_relays = self.relay_map.len();
+        // The same detached, checked view feeds delayed HTTP probes and QAD.
+        let relay_map = self.relay_allowlist.filtered_snapshot(&self.relay_map);
+        let num_relays = relay_map.len();
         let enough_relays = std::cmp::min(num_relays, ENOUGH_ENDPOINTS);
         #[cfg(wasm_browser)]
         let if_state = IfStateDetails::default();
@@ -340,7 +354,7 @@ impl Client {
         // Start the reportgen client to start any needed probes
         let (actor, mut probe_rx) = reportgen::Client::new(
             self.reports.last.clone(),
-            self.relay_map.clone(),
+            relay_map.clone(),
             self.probes.clone(),
             self.captive_portal_check,
             if_state.clone(),
@@ -354,6 +368,7 @@ impl Client {
         #[cfg(not(wasm_browser))]
         let reports = self
             .spawn_qad_probes(
+                &relay_map,
                 &if_state,
                 enough_relays,
                 do_full,
@@ -442,6 +457,7 @@ impl Client {
     #[cfg(not(wasm_browser))]
     async fn spawn_qad_probes(
         &mut self,
+        relay_map: &RelayMap,
         if_state: &IfStateDetails,
         enough_relays: usize,
         do_full: bool,
@@ -453,6 +469,24 @@ impl Client {
             return Vec::new();
         };
 
+        if self.relay_allowlist.restricted()
+            && self
+                .qad_conns
+                .v4
+                .as_ref()
+                .is_some_and(|(url, _)| !relay_map.contains(url))
+        {
+            self.qad_conns.v4.take();
+        }
+        if self.relay_allowlist.restricted()
+            && self
+                .qad_conns
+                .v6
+                .as_ref()
+                .is_some_and(|(url, _)| !relay_map.contains(url))
+        {
+            self.qad_conns.v6.take();
+        }
         if do_full {
             // clear out existing connections if we are doing a full reset
             self.qad_conns.clear();
@@ -501,7 +535,7 @@ impl Client {
         let mut v6_buf = JoinSet::new();
         let cancel_v6 = shutdown_token.child_token();
 
-        let relays = self.relay_map.relays::<Vec<_>>();
+        let relays = relay_map.relays::<Vec<_>>();
         for relay in relays.into_iter().take(MAX_RELAYS) {
             if if_state.have_v4 && needs_v4_probe {
                 trace!(?relay.url, "v4 QAD probe starting");
@@ -1008,6 +1042,78 @@ mod tests {
 
     use super::*;
     use crate::net_report::probes::Probe;
+
+    #[tokio::test]
+    async fn strict_relays_report_snapshot_and_retained_qad_are_checked() {
+        let (server, relay) = test_utils::relay().await;
+        let allowed = relay.url.clone();
+        let map = RelayMap::from(relay);
+        let tls = CaTlsConfig::insecure_skip_verify()
+            .client_config(default_provider())
+            .unwrap();
+        let ep = noq::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let opts = Options::new(tls.clone()).quic_config(Some(QuicConfig {
+            ep: ep.clone(),
+            client_config: tls,
+            ipv4: true,
+            ipv6: false,
+        }));
+        let mut policy = crate::endpoint::RelayAllowlist::default();
+        policy.restrict([allowed.clone()]);
+        let mut client = Client::new(DnsResolver::new(), map.clone(), opts, Default::default())
+            .with_relay_allowlist(policy);
+        let if_state = IfStateDetails {
+            have_v4: true,
+            have_v6: false,
+        };
+        let report = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.get_report(if_state.clone(), true, CancellationToken::new()),
+        )
+        .await
+        .unwrap();
+        assert!(report.udp_v4);
+        assert!(client.qad_conns.v4.is_some());
+        let tcp_trap = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udp_trap = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let foreign: RelayUrl = format!("http://{}/", tcp_trap.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        map.remove(&allowed);
+        map.insert(
+            foreign.clone(),
+            Arc::new(RelayConfig::new(
+                foreign,
+                Some(iroh_relay::RelayQuicConfig::new(
+                    udp_trap.local_addr().unwrap().port(),
+                )),
+            )),
+        );
+        let report = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.get_report(if_state, false, CancellationToken::new()),
+        )
+        .await
+        .unwrap();
+        assert!(report.relay_latency.is_empty());
+        assert!(client.qad_conns.v4.is_none());
+        assert!(client.qad_conns.v6.is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), tcp_trap.accept())
+                .await
+                .is_err()
+        );
+        let mut buf = [0; 128];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), udp_trap.recv_from(&mut buf))
+                .await
+                .is_err()
+        );
+        drop(client);
+        ep.close(0u32.into(), b"done");
+        ep.wait_idle().await;
+        server.shutdown().await.unwrap();
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     #[traced_test]

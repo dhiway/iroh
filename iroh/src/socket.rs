@@ -178,6 +178,7 @@ pub(crate) struct Options {
 
     /// Proxy configuration.
     pub(crate) proxy_url: Option<Url>,
+    pub(crate) relay_allowlist: crate::endpoint::RelayAllowlist,
 
     /// TLS configuration for HTTPS and non-iroh-QUIC connections.
     pub(crate) tls_config: rustls::ClientConfig,
@@ -366,6 +367,7 @@ pub(crate) struct Socket {
     #[cfg(not(wasm_browser))]
     dns_resolver: DnsResolver,
     relay_map: RelayMap,
+    relay_allowlist: crate::endpoint::RelayAllowlist,
 
     /// Optional Address Lookup
     address_lookup: address_lookup::AddressLookupServices,
@@ -878,6 +880,7 @@ impl EndpointInner {
             #[cfg(not(wasm_browser))]
             dns_resolver,
             proxy_url,
+            relay_allowlist,
             server_config,
             tls_config,
             metrics,
@@ -927,6 +930,7 @@ impl EndpointInner {
             tls_config: tls_config.clone(),
             metrics: metrics.socket.clone(),
             relay_map: relay_map.clone(),
+            relay_allowlist: relay_allowlist.clone(),
         };
 
         let shutdown_state = ShutdownState::default();
@@ -989,6 +993,7 @@ impl EndpointInner {
             mapped_addrs: remote_map.mapped_addrs.clone(),
             address_lookup,
             relay_map: relay_map.clone(),
+            relay_allowlist: relay_allowlist.clone(),
             address_lookup_user_data: RwLock::new(address_lookup_user_data),
             configured_addrs: RwLock::new(configured_addrs),
             direct_addrs,
@@ -1060,7 +1065,8 @@ impl EndpointInner {
             relay_map.clone(),
             net_report_config,
             metrics.net_report.clone(),
-        );
+        )
+        .with_relay_allowlist(relay_allowlist);
 
         let (direct_addr_done_tx, direct_addr_done_rx) = mpsc::channel(8);
         let direct_addr_update_state = DirectAddrUpdateState::new(
@@ -1234,6 +1240,10 @@ impl EndpointInner {
         relay: RelayUrl,
         endpoint: Arc<RelayConfig>,
     ) -> Option<Arc<RelayConfig>> {
+        if !self.relay_allowlist.allows_config(&relay, &endpoint) {
+            warn!("relay insertion refused by immutable endpoint policy");
+            return None;
+        }
         let res = self.relay_map.insert(relay, endpoint);
         self.actor_sender
             .send(ActorMessage::RelayMapChange)
@@ -2166,6 +2176,7 @@ mod tests {
             ],
             secret_key,
             proxy_url: None,
+            relay_allowlist: Default::default(),
             dns_resolver: DnsResolver::new(),
             server_config,
             tls_config: CaTlsConfig::default()
@@ -2585,6 +2596,7 @@ mod tests {
             address_lookup_user_data: None,
             dns_resolver,
             proxy_url: None,
+            relay_allowlist: Default::default(),
             server_config,
             tls_config: CaTlsConfig::default()
                 .client_config(crypto_provider.clone())

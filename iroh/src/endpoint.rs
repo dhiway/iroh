@@ -121,6 +121,58 @@ use crate::socket::transports::IpConfig;
 use crate::socket::transports::TransportConfig;
 pub use crate::{net_report::NetReportConfig, portmapper::PortmapperConfig};
 
+/// Immutable endpoint policy, deliberately separate from mutable relay candidates.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RelayAllowlist(Option<Arc<BTreeSet<RelayUrl>>>);
+
+impl RelayAllowlist {
+    pub(crate) fn restricted(&self) -> bool {
+        self.0.is_some()
+    }
+    pub(crate) fn allows(&self, url: &RelayUrl) -> bool {
+        self.0.as_ref().is_none_or(|set| set.contains(url))
+    }
+    pub(crate) fn allows_config(&self, key: &RelayUrl, config: &RelayConfig) -> bool {
+        !self.restricted() || (key == &config.url && self.allows(key))
+    }
+    pub(crate) fn restrict(&mut self, relays: impl IntoIterator<Item = RelayUrl>) {
+        let mut next: BTreeSet<_> = relays.into_iter().collect();
+        if let Some(current) = &self.0 {
+            next.retain(|url| current.contains(url));
+        }
+        self.0 = Some(Arc::new(next));
+    }
+    /// Validate each actual copied value, not an earlier read of a shared map.
+    pub(crate) fn checked_snapshot(&self, map: &RelayMap) -> Result<RelayMap, BindError> {
+        if !self.restricted() {
+            return Ok(map.clone());
+        }
+        let copy = RelayMap::empty();
+        for key in map.urls::<Vec<_>>() {
+            if let Some(config) = map.get(&key) {
+                if !self.allows_config(&key, &config) {
+                    return Err(e!(BindError::InvalidTransportConfig));
+                }
+                copy.insert(key, config);
+            }
+        }
+        Ok(copy)
+    }
+    /// Detached use-time view: malformed candidates never reach native probes.
+    pub(crate) fn filtered_snapshot(&self, map: &RelayMap) -> RelayMap {
+        if !self.restricted() {
+            return map.clone();
+        }
+        let copy = RelayMap::empty();
+        for key in map.urls::<Vec<_>>() {
+            if let Some(config) = map.get(&key).filter(|c| self.allows_config(&key, c)) {
+                copy.insert(key, config);
+            }
+        }
+        copy
+    }
+}
+
 /// Builder for [`Endpoint`].
 ///
 /// By default the endpoint will generate a new random [`SecretKey`], which will result in a
@@ -139,6 +191,7 @@ pub struct Builder {
     /// [`Builder::address_lookup`].
     addr_filter: Option<AddrFilter>,
     proxy_url: Option<Url>,
+    relay_allowlist: RelayAllowlist,
     ca_tls_config: Option<CaTlsConfig>,
     #[cfg(not(wasm_browser))]
     dns_resolver: Option<DnsResolver>,
@@ -185,7 +238,11 @@ impl Builder {
 
     /// Applies the given [`Preset`].
     pub fn preset(mut self, preset: impl Preset) -> Self {
+        let installed = self.relay_allowlist.clone();
         self = preset.apply(self);
+        if let Some(relays) = installed.0 {
+            self.relay_allowlist.restrict(relays.iter().cloned());
+        }
         self
     }
 
@@ -207,6 +264,7 @@ impl Builder {
             address_lookup_user_data: Default::default(),
             addr_filter: None,
             proxy_url: None,
+            relay_allowlist: RelayAllowlist::default(),
             ca_tls_config: None,
             #[cfg(not(wasm_browser))]
             dns_resolver: None,
@@ -224,7 +282,16 @@ impl Builder {
     // # The final constructor that everyone needs.
 
     /// Binds the endpoint.
-    pub async fn bind(self) -> Result<Endpoint, BindError> {
+    pub async fn bind(mut self) -> Result<Endpoint, BindError> {
+        // Reject before any endpoint, lookup, portmapper or background task exists.
+        if self.relay_allowlist.restricted() && self.proxy_url.is_some() {
+            return Err(e!(BindError::InvalidTransportConfig));
+        }
+        for transport in &mut self.transports {
+            if let TransportConfig::Relay { relay_map, .. } = transport {
+                *relay_map = self.relay_allowlist.checked_snapshot(relay_map)?;
+            }
+        }
         let secret_key = self.secret_key.unwrap_or_else(SecretKey::generate);
 
         let crypto_provider = self
@@ -275,6 +342,7 @@ impl Builder {
             secret_key,
             address_lookup_user_data: self.address_lookup_user_data,
             proxy_url: self.proxy_url,
+            relay_allowlist: self.relay_allowlist,
             #[cfg(not(wasm_browser))]
             dns_resolver,
             server_config,
@@ -549,6 +617,21 @@ impl Builder {
     }
 
     // # Methods for common customisation items.
+
+    /// Restricts every native relay path and relay probe to these exact URLs.
+    ///
+    /// This immutable policy is independent of the mutable relay candidate map.
+    /// Repeated calls intersect the sets; presets cannot remove the restriction.
+    /// An empty set disables relay traffic while retaining direct IP connectivity.
+    /// Restricted bind refuses mismatched or unapproved relay configurations and
+    /// explicit proxies before network effects. Native probe HTTP ignores ambient
+    /// proxies. This does not restrict independent address lookup HTTP clients;
+    /// use Commons readers or native `PkarrRelayClient::new_direct`
+    /// on native platforms. It does not classify arbitrary direct-peer IP addresses.
+    pub fn relay_allowlist(mut self, relays: impl IntoIterator<Item = RelayUrl>) -> Self {
+        self.relay_allowlist.restrict(relays);
+        self
+    }
 
     /// Sets the relay servers to assist in establishing connectivity.
     ///
@@ -996,7 +1079,9 @@ impl Endpoint {
     ///
     /// Replacing and returning any existing configuration for [`RelayUrl`].
     ///
-    /// Will also return `None` if the endpoint is closed.
+    /// Will also return `None` if the endpoint is closed. On a restricted endpoint,
+    /// an unapproved URL or mismatched configuration is refused without mutation
+    /// or network effects and also returns `None`.
     pub async fn insert_relay(
         &self,
         relay: RelayUrl,
@@ -4228,5 +4313,242 @@ mod tests {
             .std_context("waiting for endpoint to come online")?;
 
         Ok(())
+    }
+}
+
+#[cfg(all(test, with_crypto_provider, not(wasm_browser)))]
+mod strict_relays_tests {
+    use super::*;
+    use crate::test_utils::run_relay_server;
+    use std::{
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        time::Duration,
+    };
+    const ALPN: &[u8] = b"strict-relays-test";
+
+    #[test]
+    fn strict_relays_monotonic_snapshot_and_aliases() {
+        let a: RelayUrl = "https://relay-a.invalid/".parse().unwrap();
+        let b: RelayUrl = "https://relay-b.invalid/".parse().unwrap();
+        let map = RelayMap::from_iter([a.clone()]);
+        let mut policy = RelayAllowlist::default();
+        policy.restrict([a.clone()]);
+        let snapshot = policy.checked_snapshot(&map).unwrap();
+        map.insert(b.clone(), Arc::new(RelayConfig::from(b.clone())));
+        assert!(!snapshot.contains(&b));
+        assert!(policy.checked_snapshot(&map).is_err());
+        assert_eq!(policy.filtered_snapshot(&map), snapshot);
+        map.insert(a.clone(), Arc::new(RelayConfig::from(b.clone())));
+        assert!(policy.checked_snapshot(&map).is_err());
+        assert!(policy.filtered_snapshot(&map).is_empty());
+        policy.restrict([a.clone(), b.clone()]);
+        assert!(policy.allows(&a));
+        assert!(!policy.allows(&b));
+        policy.restrict([]);
+        policy.restrict([a]);
+        assert!(policy.0.as_ref().unwrap().is_empty());
+        let builder = Builder::new(presets::Minimal)
+            .relay_allowlist([b.clone()])
+            .preset(presets::N0)
+            .relay_mode(RelayMode::Disabled);
+        assert!(
+            !builder
+                .relay_allowlist
+                .allows(&"https://else.invalid/".parse().unwrap())
+        );
+        assert!(builder.relay_allowlist.allows(&b));
+        #[derive(Debug)]
+        struct ReplacingPreset;
+        impl Preset for ReplacingPreset {
+            fn apply(self, _: Builder) -> Builder {
+                Builder::new(presets::Minimal)
+            }
+        }
+        let replaced = builder.preset(ReplacingPreset);
+        assert!(replaced.relay_allowlist.allows(&b));
+        assert!(
+            !replaced
+                .relay_allowlist
+                .allows(&"https://else.invalid/".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_relays_reject_before_bind_and_runtime_insert() {
+        let foreign: RelayUrl = "https://foreign.invalid/".parse().unwrap();
+        assert!(
+            Builder::new(presets::Minimal)
+                .relay_allowlist([])
+                .relay_mode(RelayMode::custom([foreign.clone()]))
+                .bind()
+                .await
+                .is_err()
+        );
+        assert!(
+            Builder::new(presets::Minimal)
+                .relay_allowlist([])
+                .proxy_url("http://proxy.invalid/".parse().unwrap())
+                .bind()
+                .await
+                .is_err()
+        );
+        let allowed: RelayUrl = "https://allowed.invalid/".parse().unwrap();
+        let ep = Builder::new(presets::Minimal)
+            .relay_allowlist([allowed.clone()])
+            .portmapper_config(PortmapperConfig::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        assert!(
+            ep.insert_relay(
+                foreign.clone(),
+                Arc::new(RelayConfig::from(foreign.clone()))
+            )
+            .await
+            .is_none()
+        );
+        assert!(
+            ep.insert_relay(
+                allowed.clone(),
+                Arc::new(RelayConfig::from(foreign.clone()))
+            )
+            .await
+            .is_none()
+        );
+        assert!(ep.remove_relay(&foreign).await.is_none());
+        assert!(ep.remove_relay(&allowed).await.is_none());
+        ep.close().await;
+    }
+
+    async fn exchange(client: &Endpoint, server: &Endpoint, addr: EndpointAddr) {
+        let accepted = async {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let mut stream = conn.accept_uni().await.unwrap();
+            let bytes = stream.read_to_end(1024).await.unwrap();
+            assert_eq!(bytes, b"native strict relay bytes");
+            conn.close(0u32.into(), b"received");
+        };
+        let sent = async {
+            let conn = client.connect(addr, ALPN).await.unwrap();
+            let mut stream = conn.open_uni().await.unwrap();
+            stream
+                .write_all(b"native strict relay bytes")
+                .await
+                .unwrap();
+            stream.finish().unwrap();
+            conn.closed().await;
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(accepted, sent);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn strict_relays_empty_policy_preserves_ipv4_ipv6_direct_and_blocks_foreign_hint() {
+        let trap = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let foreign: RelayUrl = format!("http://{}/", trap.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            let build = || {
+                Builder::new(presets::Minimal)
+                    .relay_allowlist([])
+                    .alpns(vec![ALPN.to_vec()])
+                    .portmapper_config(PortmapperConfig::Disabled)
+                    .clear_ip_transports()
+                    .bind_addr((ip, 0))
+                    .unwrap()
+            };
+            let client = build().bind().await.unwrap();
+            let server = build().bind().await.unwrap();
+            let addr = EndpointAddr::from_parts(
+                server.id(),
+                [
+                    TransportAddr::Ip(server.bound_sockets()[0]),
+                    TransportAddr::Relay(foreign.clone()),
+                ],
+            );
+            exchange(&client, &server, addr).await;
+            // A relay-only attempt must not create any connection to the trap.
+            assert!(!matches!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    client.connect(
+                        EndpointAddr::new(SecretKey::generate().public())
+                            .with_relay_url(foreign.clone()),
+                        b"other"
+                    )
+                )
+                .await,
+                Ok(Ok(_))
+            ));
+            client.close().await;
+            server.close().await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), trap.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_relays_approved_native_relay_transfers_bytes_and_detaches_map() {
+        let (map, url, relay) = run_relay_server().await.unwrap();
+        let trap = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let foreign: RelayUrl = format!("http://{}/", trap.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let build = || {
+            Builder::new(presets::Minimal)
+                .relay_allowlist([url.clone()])
+                .alpns(vec![ALPN.to_vec()])
+                .relay_mode(RelayMode::Custom(map.clone()))
+                .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                .portmapper_config(PortmapperConfig::Disabled)
+                .clear_ip_transports()
+        };
+        let client = build().bind().await.unwrap();
+        let server = build().bind().await.unwrap();
+        map.insert(foreign.clone(), Arc::new(RelayConfig::from(foreign)));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(client.online(), server.online());
+        })
+        .await
+        .unwrap();
+        exchange(
+            &client,
+            &server,
+            EndpointAddr::new(server.id()).with_relay_url(url),
+        )
+        .await;
+        client.network_change().await;
+        assert!(
+            client
+                .remove_relay(
+                    &format!("http://{}/", trap.local_addr().unwrap())
+                        .parse()
+                        .unwrap()
+                )
+                .await
+                .is_none()
+        );
+        client.close().await;
+        server.close().await;
+        relay.shutdown().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), trap.accept())
+                .await
+                .is_err()
+        );
     }
 }

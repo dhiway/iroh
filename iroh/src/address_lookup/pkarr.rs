@@ -460,11 +460,19 @@ impl PkarrResolverBuilder {
         let pkarr_client = PkarrRelayClient::new(self.pkarr_relay);
 
         #[cfg(not(wasm_browser))]
-        let pkarr_client = PkarrRelayClient::new(
-            self.pkarr_relay,
-            tls_config,
-            self.dns_resolver.unwrap_or_default(),
-        );
+        let pkarr_client = if self.commons {
+            PkarrRelayClient::new_direct(
+                self.pkarr_relay,
+                tls_config,
+                self.dns_resolver.unwrap_or_default(),
+            )
+        } else {
+            PkarrRelayClient::new(
+                self.pkarr_relay,
+                tls_config,
+                self.dns_resolver.unwrap_or_default(),
+            )
+        };
 
         PkarrResolver {
             pkarr_client,
@@ -580,6 +588,7 @@ impl AddressLookup for PkarrResolver {
 pub struct PkarrRelayClient {
     http_client: reqwest::Client,
     pkarr_relay_url: Url,
+    direct: bool,
 }
 
 /// A builder for the [`PkarrRelayClient`]
@@ -605,6 +614,7 @@ impl PkarrRelayClientBuilder {
         PkarrRelayClient {
             http_client,
             pkarr_relay_url: self.pkarr_relay_url,
+            direct: false,
         }
     }
 }
@@ -623,6 +633,7 @@ impl PkarrRelayClient {
         Self {
             http_client,
             pkarr_relay_url,
+            direct: false,
         }
     }
 
@@ -635,7 +646,48 @@ impl PkarrRelayClient {
         Self {
             http_client,
             pkarr_relay_url,
+            direct: false,
         }
+    }
+
+    /// Creates a native direct HTTP client for an explicitly configured service.
+    ///
+    /// GET and PUT never follow redirects or use ambient HTTP proxies. Native TLS,
+    /// requested-key signature verification and packet decoding are unchanged.
+    /// Unlike ordinary constructors, a trailing slash on the base URL is normalized
+    /// before appending the endpoint key. Browser redirect/proxy enforcement is not
+    /// provided; this constructor is native-only.
+    #[cfg(not(wasm_browser))]
+    pub fn new_direct(
+        pkarr_relay_url: Url,
+        tls_config: rustls::ClientConfig,
+        dns_resolver: DnsResolver,
+    ) -> Self {
+        let http_client = reqwest_client_builder(tls_config, dns_resolver)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .expect("failed to create reqwest client");
+        Self {
+            http_client,
+            pkarr_relay_url,
+            direct: true,
+        }
+    }
+
+    fn request_url(&self, endpoint_id: &EndpointId) -> Result<Url, PkarrError> {
+        let mut url = self.pkarr_relay_url.clone();
+        let mut segments = url.path_segments_mut().map_err(|_| {
+            e!(PkarrError::InvalidRelayUrl {
+                url: self.pkarr_relay_url.clone().into()
+            })
+        })?;
+        if self.direct {
+            segments.pop_if_empty();
+        }
+        segments.push(&endpoint_id.to_z32());
+        drop(segments);
+        Ok(url)
     }
 
     /// Resolves a [`SignedPacket`] for the given [`EndpointId`].
@@ -643,14 +695,7 @@ impl PkarrRelayClient {
         &self,
         endpoint_id: EndpointId,
     ) -> Result<SignedPacket, AddressLookupError> {
-        let mut url = self.pkarr_relay_url.clone();
-        url.path_segments_mut()
-            .map_err(|_| {
-                e!(PkarrError::InvalidRelayUrl {
-                    url: self.pkarr_relay_url.clone().into()
-                })
-            })?
-            .push(&endpoint_id.to_z32());
+        let url = self.request_url(&endpoint_id)?;
 
         let response = self
             .http_client
@@ -677,14 +722,7 @@ impl PkarrRelayClient {
 
     /// Publishes a [`SignedPacket`].
     pub async fn publish(&self, signed_packet: &SignedPacket) -> Result<(), PkarrError> {
-        let mut url = self.pkarr_relay_url.clone();
-        url.path_segments_mut()
-            .map_err(|_| {
-                e!(PkarrError::InvalidRelayUrl {
-                    url: self.pkarr_relay_url.clone().into()
-                })
-            })?
-            .push(&signed_packet.public_key().to_z32());
+        let url = self.request_url(&signed_packet.public_key())?;
 
         let response = self
             .http_client
@@ -722,12 +760,12 @@ mod cmns_lookup_tests {
     struct LoopbackResolver(Arc<AtomicUsize>);
     impl Resolver for LoopbackResolver {
         fn lookup_ipv4(&self, host: String) -> BoxFuture<Result<BoxIter<Ipv4Addr>, DnsError>> {
-            assert_eq!(host, "localhost");
+            assert!(matches!(host.as_str(), "localhost" | "profile.test"));
             self.0.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(Box::new([Ipv4Addr::LOCALHOST].into_iter()) as BoxIter<Ipv4Addr>) })
         }
         fn lookup_ipv6(&self, host: String) -> BoxFuture<Result<BoxIter<Ipv6Addr>, DnsError>> {
-            assert_eq!(host, "localhost");
+            assert!(matches!(host.as_str(), "localhost" | "profile.test"));
             Box::pin(async { Ok(Box::new(std::iter::empty()) as BoxIter<Ipv6Addr>) })
         }
         fn lookup_txt(&self, _: String) -> BoxFuture<Result<BoxIter<TxtRecordData>, DnsError>> {
@@ -939,5 +977,235 @@ mod cmns_lookup_tests {
         endpoint.close().await;
         server_result.unwrap().unwrap().unwrap();
         result.unwrap().unwrap();
+    }
+    #[tokio::test]
+    async fn strict_pkarr_redirects_and_exact_paths() {
+        use axum::{response::Redirect, routing::any};
+        use std::{sync::Mutex, time::Duration};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/forbidden", target.local_addr().unwrap());
+        let target_task = tokio::spawn(
+            axum::serve(
+                target,
+                Router::new().fallback(any({
+                    let hits = hits.clone();
+                    move || {
+                        let hits = hits.clone();
+                        async move {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            http::StatusCode::BAD_GATEWAY
+                        }
+                    }
+                })),
+            )
+            .into_future(),
+        );
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base: Url = format!("http://{}/pkarr/", source.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let source_task = tokio::spawn(
+            axum::serve(
+                source,
+                Router::new().fallback(any({
+                    let paths = paths.clone();
+                    move |uri: http::Uri| {
+                        let paths = paths.clone();
+                        let target_url = target_url.clone();
+                        async move {
+                            paths.lock().unwrap().push(uri.path().to_owned());
+                            Redirect::temporary(&target_url)
+                        }
+                    }
+                })),
+            )
+            .into_future(),
+        );
+        let tls = || {
+            iroh_relay::tls::CaTlsConfig::default()
+                .client_config(iroh_relay::tls::default_provider())
+                .unwrap()
+        };
+        let key = SecretKey::from_bytes(&[12; 32]);
+        let packet = signed_packet(&key, &[("_cmns", "addr=127.0.0.1:1234")]);
+        let direct = PkarrRelayClient::new_direct(base.clone(), tls(), DnsResolver::new());
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            assert!(direct.resolve(key.public()).await.is_err());
+            assert!(direct.publish(&packet).await.is_err());
+            let resolver = PkarrResolver::cmns_builder(base.clone()).build(tls());
+            assert!(
+                resolver
+                    .resolve(key.public())
+                    .unwrap()
+                    .next()
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                *paths.lock().unwrap(),
+                vec![format!("/pkarr/{}", key.public().to_z32()); 3]
+            );
+            // Positive trap control: ordinary clients retain their redirect behavior.
+            let ordinary =
+                PkarrRelayClient::new(base.join("../pkarr").unwrap(), tls(), DnsResolver::new());
+            assert!(ordinary.resolve(key.public()).await.is_err());
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        })
+        .await;
+        source_task.abort();
+        target_task.abort();
+        let _ = source_task.await;
+        let _ = target_task.await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn strict_pkarr_proxy_environment() {
+        use axum::routing::any;
+        use std::time::Duration;
+        const CHILD: &str = "T268_200_PROXY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy = format!("http://{}/", listener.local_addr().unwrap());
+            let task = tokio::spawn(
+                axum::serve(
+                    listener,
+                    Router::new().fallback(any({
+                        let hits = hits.clone();
+                        move || {
+                            let hits = hits.clone();
+                            async move {
+                                hits.fetch_add(1, Ordering::SeqCst);
+                                http::StatusCode::BAD_GATEWAY
+                            }
+                        }
+                    })),
+                )
+                .into_future(),
+            );
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "address_lookup::pkarr::cmns_lookup_tests::strict_pkarr_proxy_environment",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("NO_PROXY", "")
+                .env("no_proxy", "");
+            for name in [
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+            ] {
+                command.env(name, &proxy);
+            }
+            let mut child = command
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let finished = tokio::time::timeout(Duration::from_secs(15), async {
+                while child.try_wait().unwrap().is_none() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            if finished.is_err() {
+                let _ = child.kill();
+            }
+            let output = child.wait_with_output().unwrap();
+            task.abort();
+            let _ = task.await;
+            assert!(finished.is_ok(), "proxy child exceeded its deadline");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                1,
+                "only the ordinary-client positive control reaches the proxy"
+            );
+            return;
+        }
+        let key = SecretKey::from_bytes(&[13; 32]);
+        let packet = signed_packet(&key, &[("_cmns", "addr=127.0.0.1:1234")]);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base: Url = format!(
+            "http://profile.test:{}/pkarr/",
+            listener.local_addr().unwrap().port()
+        )
+        .parse()
+        .unwrap();
+        let expected = format!("/pkarr/{}", key.public().to_z32());
+        let task = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new().fallback(any({
+                    let hits = hits.clone();
+                    move |method: http::Method, uri: http::Uri| {
+                        let hits = hits.clone();
+                        let expected = expected.clone();
+                        let packet = packet.clone();
+                        async move {
+                            assert_eq!(uri.path(), expected);
+                            hits.fetch_add(1, Ordering::SeqCst);
+                            if method == http::Method::PUT {
+                                (http::StatusCode::NO_CONTENT, Vec::new())
+                            } else {
+                                (http::StatusCode::OK, packet.to_relay_payload().to_vec())
+                            }
+                        }
+                    }
+                })),
+            )
+            .into_future(),
+        );
+        let tls = || {
+            iroh_relay::tls::CaTlsConfig::default()
+                .client_config(iroh_relay::tls::default_provider())
+                .unwrap()
+        };
+        let dns = || DnsResolver::custom(LoopbackResolver::default());
+        let result = tokio::time::timeout(Duration::from_secs(8), async {
+            let ordinary = PkarrRelayClient::new(base.clone(), tls(), dns());
+            assert!(ordinary.resolve(key.public()).await.is_err());
+            let direct = PkarrRelayClient::new_direct(base.clone(), tls(), dns());
+            assert_eq!(
+                direct.resolve(key.public()).await.unwrap().public_key(),
+                key.public()
+            );
+            let packet = signed_packet(&key, &[("_cmns", "addr=127.0.0.1:1234")]);
+            direct.publish(&packet).await.unwrap();
+            let resolver = PkarrResolver::cmns_builder(base)
+                .dns_resolver(dns())
+                .build(tls());
+            assert!(
+                resolver
+                    .resolve(key.public())
+                    .unwrap()
+                    .next()
+                    .await
+                    .unwrap()
+                    .is_ok()
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), 3);
+        })
+        .await;
+        task.abort();
+        let _ = task.await;
+        result.unwrap();
     }
 }
