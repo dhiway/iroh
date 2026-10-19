@@ -107,7 +107,11 @@ impl RelayTransport {
         );
         let relay_allowlist = self.relay_allowlist.clone();
         let mut num_msgs = 0;
-        for i in 0..bufs.len() {
+        let mut consumed = false;
+        // Bound work by the caller's batch capacity, but compact accepted datagrams:
+        // a rejected/oversized input must never leave an unwritten returned slot.
+        for _ in 0..bufs.len() {
+            let i = num_msgs;
             let buf_out = &mut bufs[i];
             let meta_out = &mut metas[i];
             let recv_info = &mut recv_infos[i];
@@ -125,6 +129,7 @@ impl RelayTransport {
                 }
             };
 
+            consumed = true;
             if !relay_allowlist.allows(&dm.url) {
                 self.pending_item = None;
                 continue;
@@ -199,6 +204,12 @@ impl RelayTransport {
             assert!(num_msgs <= metas.len());
             Poll::Ready(Ok(num_msgs))
         } else {
+            // A batch of discarded inputs can exhaust our work budget without
+            // polling an empty receiver (and hence without registering a waker).
+            // Give queued valid input another bounded poll without a new send.
+            if consumed {
+                cx.waker().wake_by_ref();
+            }
             Poll::Pending
         }
     }
@@ -444,6 +455,101 @@ mod tests {
             relay_allowlist: Default::default(),
         };
         RelayTransport::new(config, CancellationToken::new())
+    }
+
+    fn strict_recv_item(
+        url: RelayUrl,
+        peer: EndpointId,
+        bytes: &'static [u8],
+    ) -> RelayRecvDatagram {
+        RelayRecvDatagram {
+            url,
+            src: peer,
+            datagrams: Datagrams {
+                contents: Bytes::from_static(bytes),
+                segment_size: None,
+                ecn: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_relays_receive_compacts_denied_then_valid_batch() {
+        let mut transport = test_relay_transport();
+        let allowed: RelayUrl = "https://allowed.invalid/".parse().unwrap();
+        let denied: RelayUrl = "https://denied.invalid/".parse().unwrap();
+        transport.relay_allowlist.restrict([allowed.clone()]);
+        let peer = SecretKey::generate().public();
+        let (tx, rx) = mpsc::channel(8);
+        transport.relay_datagram_recv_queue = rx;
+        tx.try_send(strict_recv_item(denied, peer, b"denied"))
+            .unwrap();
+        tx.try_send(strict_recv_item(allowed.clone(), peer, b"valid"))
+            .unwrap();
+        let mut a = [0xaau8; 64];
+        let mut b = [0xbbu8; 64];
+        let mut bufs = [io::IoSliceMut::new(&mut a), io::IoSliceMut::new(&mut b)];
+        let mut metas = [noq_udp::RecvMeta::default(); 2];
+        let mut infos = [RecvInfo::default(), RecvInfo::default()];
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            transport.poll_recv(&mut cx, &mut bufs, &mut metas, &mut infos),
+            Poll::Ready(Ok(1))
+        ));
+        assert_eq!(&a[..metas[0].len], b"valid");
+        assert_eq!(metas[0].stride, 5);
+        assert!(
+            matches!(infos[0].remote(), super::super::Addr::Relay(url,id) if url == &allowed && id == &peer)
+        );
+        assert_eq!(b, [0xbb; 64]);
+    }
+
+    #[derive(Default)]
+    struct StrictWakeCounter(std::sync::atomic::AtomicUsize);
+    impl std::task::Wake for StrictWakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_relays_receive_denied_budget_wakes_queued_valid_without_new_send() {
+        let mut transport = test_relay_transport();
+        let allowed: RelayUrl = "https://allowed.invalid/".parse().unwrap();
+        let denied: RelayUrl = "https://denied.invalid/".parse().unwrap();
+        transport.relay_allowlist.restrict([allowed.clone()]);
+        let peer = SecretKey::generate().public();
+        let (tx, rx) = mpsc::channel(8);
+        transport.relay_datagram_recv_queue = rx;
+        for _ in 0..2 {
+            tx.try_send(strict_recv_item(denied.clone(), peer, b"denied"))
+                .unwrap();
+        }
+        tx.try_send(strict_recv_item(allowed.clone(), peer, b"valid"))
+            .unwrap();
+        let counter = Arc::new(StrictWakeCounter::default());
+        let waker = std::task::Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut a = [0xaau8; 64];
+        let mut b = [0xbbu8; 64];
+        let mut bufs = [io::IoSliceMut::new(&mut a), io::IoSliceMut::new(&mut b)];
+        let mut metas = [noq_udp::RecvMeta::default(); 2];
+        let mut infos = [RecvInfo::default(), RecvInfo::default()];
+        assert!(
+            transport
+                .poll_recv(&mut cx, &mut bufs, &mut metas, &mut infos)
+                .is_pending()
+        );
+        assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // No producer activity between polls: only the receive self-wake permits progress.
+        assert!(matches!(
+            transport.poll_recv(&mut cx, &mut bufs, &mut metas, &mut infos),
+            Poll::Ready(Ok(1))
+        ));
+        assert_eq!(&a[..metas[0].len], b"valid");
+        assert!(
+            matches!(infos[0].remote(), super::super::Addr::Relay(url,id) if url == &allowed && id == &peer)
+        );
     }
 
     #[tokio::test]
