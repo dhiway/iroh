@@ -1043,6 +1043,117 @@ mod tests {
     use super::*;
     use crate::net_report::probes::Probe;
 
+    #[derive(Debug, Clone, Default)]
+    struct StrictSnapshotDns(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+    impl StrictSnapshotDns {
+        fn lookup<T: Send + 'static>(
+            &self,
+            host: String,
+        ) -> n0_future::boxed::BoxFuture<
+            std::result::Result<iroh_dns::dns::BoxIter<T>, iroh_dns::dns::DnsError>,
+        > {
+            self.0.lock().unwrap().push(host);
+            Box::pin(async { Ok(Box::new(std::iter::empty::<T>()) as iroh_dns::dns::BoxIter<T>) })
+        }
+    }
+    impl iroh_dns::dns::Resolver for StrictSnapshotDns {
+        fn lookup_ipv4(
+            &self,
+            host: String,
+        ) -> n0_future::boxed::BoxFuture<
+            std::result::Result<
+                iroh_dns::dns::BoxIter<std::net::Ipv4Addr>,
+                iroh_dns::dns::DnsError,
+            >,
+        > {
+            self.lookup(host)
+        }
+        fn lookup_ipv6(
+            &self,
+            host: String,
+        ) -> n0_future::boxed::BoxFuture<
+            std::result::Result<
+                iroh_dns::dns::BoxIter<std::net::Ipv6Addr>,
+                iroh_dns::dns::DnsError,
+            >,
+        > {
+            self.lookup(host)
+        }
+        fn lookup_txt(
+            &self,
+            host: String,
+        ) -> n0_future::boxed::BoxFuture<
+            std::result::Result<
+                iroh_dns::dns::BoxIter<iroh_dns::dns::TxtRecordData>,
+                iroh_dns::dns::DnsError,
+            >,
+        > {
+            self.lookup(host)
+        }
+        fn clear_cache(&self) {}
+        fn reset(&self) -> Box<dyn iroh_dns::dns::Resolver> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_relays_delayed_captive_probe_uses_detached_report_snapshot() {
+        let allowed: RelayUrl = "https://approved.invalid/".parse().unwrap();
+        let foreign: RelayUrl = "https://forbidden.invalid/".parse().unwrap();
+        let map = RelayMap::from(allowed.clone());
+        let dns = StrictSnapshotDns::default();
+        let tls = CaTlsConfig::default()
+            .client_config(default_provider())
+            .unwrap();
+        // Only the delayed captive probe runs. The custom native resolver records
+        // its destination but returns no IPs, so there are no external packets.
+        let opts = Options::new(tls).net_report_config(NetReportConfig {
+            https_probes: false,
+            captive_portal_check: true,
+        });
+        let mut policy = crate::endpoint::RelayAllowlist::default();
+        policy.restrict([allowed.clone()]);
+        let mut client = Client::new(
+            DnsResolver::custom(dns.clone()),
+            map.clone(),
+            opts,
+            Default::default(),
+        )
+        .with_relay_allowlist(policy);
+        let _report = {
+            let mut report = std::pin::pin!(client.get_report(
+                IfStateDetails {
+                    have_v4: true,
+                    have_v6: false
+                },
+                true,
+                CancellationToken::new()
+            ));
+            // Poll the real report to its first await: its snapshot is captured,
+            // but the captive task still has its native delay before selecting a URL.
+            std::future::poll_fn(|cx| {
+                assert!(report.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(dns.0.lock().unwrap().is_empty());
+            map.remove(&allowed);
+            map.insert(foreign.clone(), Arc::new(RelayConfig::from(foreign)));
+            tokio::time::timeout(Duration::from_secs(5), report)
+                .await
+                .unwrap()
+        };
+        let queries = dns.0.lock().unwrap();
+        assert!(
+            !queries.is_empty(),
+            "the delayed probe must actually query its destination"
+        );
+        assert!(
+            queries.iter().all(|host| host == "approved.invalid"),
+            "unexpected native DNS queries: {queries:?}"
+        );
+    }
+
     #[tokio::test]
     async fn strict_relays_report_snapshot_and_retained_qad_are_checked() {
         let (server, relay) = test_utils::relay().await;

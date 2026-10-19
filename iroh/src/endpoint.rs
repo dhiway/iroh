@@ -4460,6 +4460,8 @@ mod strict_relays_tests {
             let build = || {
                 Builder::new(presets::Minimal)
                     .relay_allowlist([])
+                    // Keep the native relay sender active even with no home candidates.
+                    .relay_mode(RelayMode::Custom(RelayMap::empty()))
                     .alpns(vec![ALPN.to_vec()])
                     .portmapper_config(PortmapperConfig::Disabled)
                     .clear_ip_transports()
@@ -4479,7 +4481,7 @@ mod strict_relays_tests {
             // A relay-only attempt must not create any connection to the trap.
             assert!(!matches!(
                 tokio::time::timeout(
-                    Duration::from_millis(100),
+                    Duration::from_millis(500),
                     client.connect(
                         EndpointAddr::new(SecretKey::generate().public())
                             .with_relay_url(foreign.clone()),
@@ -4500,7 +4502,7 @@ mod strict_relays_tests {
     }
 
     #[tokio::test]
-    async fn strict_relays_approved_native_relay_transfers_bytes_and_detaches_map() {
+    async fn strict_relays_approved_native_relay_transfers_after_network_change_and_detaches_map() {
         let (map, url, relay) = run_relay_server().await.unwrap();
         let trap = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -4528,10 +4530,20 @@ mod strict_relays_tests {
         exchange(
             &client,
             &server,
-            EndpointAddr::new(server.id()).with_relay_url(url),
+            EndpointAddr::new(server.id()).with_relay_url(url.clone()),
         )
         .await;
         client.network_change().await;
+        server.network_change().await;
+        // exchange closes its QUIC connection: this is another actual native
+        // connection and byte transfer after the network-change notification.
+        // It does not claim the underlying relay TCP session was disconnected.
+        exchange(
+            &client,
+            &server,
+            EndpointAddr::new(server.id()).with_relay_url(url),
+        )
+        .await;
         assert!(
             client
                 .remove_relay(
