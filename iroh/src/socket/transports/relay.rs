@@ -107,14 +107,12 @@ impl RelayTransport {
         );
         let relay_allowlist = self.relay_allowlist.clone();
         let mut num_msgs = 0;
-        let mut consumed = false;
-        // Bound work by the caller's batch capacity, but compact accepted datagrams:
-        // a rejected/oversized input must never leave an unwritten returned slot.
+        // Bound the work even if every received batch is dropped. Only advance the
+        // output slot when we actually fill it.
         for _ in 0..bufs.len() {
-            let i = num_msgs;
-            let buf_out = &mut bufs[i];
-            let meta_out = &mut metas[i];
-            let recv_info = &mut recv_infos[i];
+            let buf_out = &mut bufs[num_msgs];
+            let meta_out = &mut metas[num_msgs];
+            let recv_info = &mut recv_infos[num_msgs];
             let dm = match self.poll_recv_queue(cx) {
                 Poll::Ready(Some(recv)) => recv,
                 Poll::Ready(None) => {
@@ -125,11 +123,13 @@ impl RelayTransport {
                     )));
                 }
                 Poll::Pending => {
+                    if num_msgs == 0 {
+                        return Poll::Pending;
+                    }
                     break;
                 }
             };
 
-            consumed = true;
             if !relay_allowlist.allows(&dm.url) {
                 self.pending_item = None;
                 continue;
@@ -168,14 +168,13 @@ impl RelayTransport {
 
             if buf_out.len() < dm.datagrams.contents.len() {
                 // Our receive buffer isn't big enough to process this datagram.
-                // Continuing would cause a panic.
+                // Copying it would cause a panic.
                 warn!(
                     noq_buf_len = buf_out.len(),
                     datagram_len = dm.datagrams.contents.len(),
                     segment_size = ?dm.datagrams.segment_size,
                     "dropping received datagram: noq buffer too small"
                 );
-                break;
                 // In theory we could put some logic in here to fragment the datagram in case
                 // we still have enough room in our `buf_out` left to fit a couple of
                 // `dm.datagrams.segment_size`es, but we *should* have cut those datagrams
@@ -184,6 +183,7 @@ impl RelayTransport {
                 // So the only case in which this happens is we receive a datagram via the relay
                 // that's essentially bigger than our configured `max_udp_payload_size`.
                 // In that case we drop it and let MTU discovery take over.
+                continue;
             }
 
             buf_out[..dm.datagrams.contents.len()].copy_from_slice(&dm.datagrams.contents);
@@ -199,15 +199,15 @@ impl RelayTransport {
             num_msgs += 1;
         }
 
-        // If we have any msgs to report, they are in the first `num_msgs_total` slots
+        // If we have any msgs to report, they are in the first `num_msgs` slots.
         if num_msgs > 0 {
             assert!(num_msgs <= metas.len());
             Poll::Ready(Ok(num_msgs))
         } else {
-            // A batch of discarded inputs can exhaust our work budget without
-            // polling an empty receiver (and hence without registering a waker).
-            // Give queued valid input another bounded poll without a new send.
-            if consumed {
+            if !bufs.is_empty() {
+                // Every receive attempt dropped data, so we haven't polled the queue
+                // to Pending. More data may still be queued, and no queue wake is
+                // guaranteed. Wake to ensure another poll.
                 cx.waker().wake_by_ref();
             }
             Poll::Pending
@@ -359,7 +359,11 @@ mod tests {
     use std::{
         collections::BTreeSet,
         num::NonZeroU16,
-        sync::{Arc, atomic::AtomicBool},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        task::{Wake, Waker},
         time::Duration,
     };
 
@@ -372,7 +376,7 @@ mod tests {
     use tracing::debug;
 
     use super::*;
-    use crate::{defaults::staging, dns::DnsResolver};
+    use crate::{defaults::staging, dns::DnsResolver, socket::transports::Addr};
 
     impl RelaySender {
         pub(in crate::socket::transports) fn bounded_for_test(
@@ -440,7 +444,7 @@ mod tests {
 
     /// Builds a [`RelayTransport`] that never actually dials a relay (its home
     /// relay watcher is left unset), just so we get a real `poll_recv` to exercise.
-    fn test_relay_transport() -> RelayTransport {
+    fn test_relay_transport() -> (RelayTransport, mpsc::Sender<RelayRecvDatagram>) {
         let config = RelayActorConfig {
             my_relay: HomeRelayWatch::default(),
             secret_key: SecretKey::from_bytes(&[7u8; 32]),
@@ -454,7 +458,10 @@ mod tests {
             relay_map: RelayMap::empty(),
             relay_allowlist: Default::default(),
         };
-        RelayTransport::new(config, CancellationToken::new())
+        let mut transport = RelayTransport::new(config, CancellationToken::new());
+        let (sender, receiver) = mpsc::channel(16);
+        transport.relay_datagram_recv_queue = receiver;
+        (transport, sender)
     }
 
     fn strict_recv_item(
@@ -475,7 +482,7 @@ mod tests {
 
     #[tokio::test]
     async fn strict_relays_receive_compacts_denied_then_valid_batch() {
-        let mut transport = test_relay_transport();
+        let (mut transport, _recv_sender) = test_relay_transport();
         let allowed: RelayUrl = "https://allowed.invalid/".parse().unwrap();
         let denied: RelayUrl = "https://denied.invalid/".parse().unwrap();
         transport.relay_allowlist.restrict([allowed.clone()]);
@@ -514,7 +521,7 @@ mod tests {
 
     #[tokio::test]
     async fn strict_relays_receive_denied_budget_wakes_queued_valid_without_new_send() {
-        let mut transport = test_relay_transport();
+        let (mut transport, _recv_sender) = test_relay_transport();
         let allowed: RelayUrl = "https://allowed.invalid/".parse().unwrap();
         let denied: RelayUrl = "https://denied.invalid/".parse().unwrap();
         transport.relay_allowlist.restrict([allowed.clone()]);
@@ -554,7 +561,7 @@ mod tests {
 
     #[tokio::test]
     async fn strict_relays_sender_and_receive_reject_unapproved_metadata() {
-        let mut transport = test_relay_transport();
+        let (mut transport, _recv_sender) = test_relay_transport();
         transport.relay_allowlist.restrict([]);
         let url: RelayUrl = "https://forbidden.invalid/".parse().unwrap();
         let peer = SecretKey::generate().public();
@@ -598,48 +605,132 @@ mod tests {
         assert!(transport.pending_item.is_none());
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn progress_is_made_for_large_segment_size_datagram_batch() {
-        let mut transport = test_relay_transport();
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
 
-        let url = staging::default_na_east_relay().url;
-        let src = EndpointId::from_bytes(&[3u8; 32]).unwrap();
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
-        // Fat datagram batch with segment size larger than the buffer
-        let datagrams = Datagrams {
-            ecn: None,
-            segment_size: NonZeroU16::new(2000),
-            contents: Bytes::from(vec![0u8; 4000]),
-        };
-
-        transport.pending_item = Some(RelayRecvDatagram {
-            url,
-            src,
-            datagrams,
-        });
-
-        let waker = std::task::Waker::noop();
-        let mut cx = Context::from_waker(waker);
-
-        // Deliberately smaller than the 2000-byte segment size above
-        let mut storage = [0u8; 1500];
-        let mut metas = [noq_udp::RecvMeta::default()];
-        let mut recv_infos = [RecvInfo::default()];
-
-        let mut progressed = false;
-        // progress does not need to be immediate but within a reasonable number of iterations
-        for _ in 0..10 {
-            let mut bufs = [io::IoSliceMut::new(&mut storage)];
-            match transport.poll_recv(&mut cx, &mut bufs, &mut metas, &mut recv_infos) {
-                Poll::Ready(Ok(_)) | Poll::Pending => {}
-                Poll::Ready(Err(err)) => panic!("poll_recv failed: {err}"),
+    #[tokio::test]
+    async fn relay_recv_outputs_are_contiguous_after_drops() {
+        for segment_size in [NonZeroU16::new(2000), None] {
+            let (mut transport, sender) = test_relay_transport();
+            let url = staging::default_na_east_relay().url;
+            let sources = [
+                SecretKey::from_bytes(&[8u8; 32]).public(),
+                SecretKey::from_bytes(&[9u8; 32]).public(),
+            ];
+            let messages = [
+                Datagrams::from(b"first"),
+                Datagrams {
+                    ecn: None,
+                    segment_size: NonZeroU16::new(3),
+                    contents: Bytes::from_static(b"second"),
+                },
+            ];
+            for (src, datagrams) in sources.into_iter().zip(messages.iter()) {
+                sender
+                    .try_send(RelayRecvDatagram {
+                        url: url.clone(),
+                        src,
+                        datagrams: Datagrams {
+                            ecn: None,
+                            segment_size,
+                            contents: Bytes::from(vec![0u8; 4000]),
+                        },
+                    })
+                    .unwrap();
+                sender
+                    .try_send(RelayRecvDatagram {
+                        url: url.clone(),
+                        src,
+                        datagrams: datagrams.clone(),
+                    })
+                    .unwrap();
             }
-            if transport.pending_item.is_none() {
-                progressed = true;
-                break;
+
+            let mut storage = [[0u8; 1472]; 4];
+            let mut bufs = storage.each_mut().map(|buf| io::IoSliceMut::new(buf));
+            let mut metas = [noq_udp::RecvMeta::default(); 4];
+            let mut recv_infos: [RecvInfo; 4] = std::array::from_fn(|_| RecvInfo::default());
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(matches!(
+                transport.poll_recv(&mut cx, &mut bufs, &mut metas, &mut recv_infos),
+                Poll::Ready(Ok(2))
+            ));
+            for i in 0..messages.len() {
+                assert_eq!(&bufs[i][..metas[i].len], &messages[i].contents[..]);
+                assert_eq!(metas[i].stride, if i == 0 { 5 } else { 3 });
+                assert_eq!(
+                    recv_infos[i].remote(),
+                    &Addr::Relay(url.clone(), sources[i])
+                );
             }
         }
+    }
 
-        assert!(progressed, "poll_recv made no progress on batch too large");
+    #[tokio::test]
+    async fn relay_recv_wakes_after_exhausting_drop_budget() {
+        for segment_size in [NonZeroU16::new(2000), None] {
+            let (mut transport, sender) = test_relay_transport();
+            let url = staging::default_na_east_relay().url;
+            let src = SecretKey::from_bytes(&[8u8; 32]).public();
+            for _ in 0..2 {
+                sender
+                    .try_send(RelayRecvDatagram {
+                        url: url.clone(),
+                        src,
+                        datagrams: Datagrams {
+                            ecn: None,
+                            segment_size,
+                            contents: Bytes::from(vec![0u8; 4000]),
+                        },
+                    })
+                    .unwrap();
+            }
+            sender
+                .try_send(RelayRecvDatagram {
+                    url: url.clone(),
+                    src,
+                    datagrams: Datagrams::from(b"usable"),
+                })
+                .unwrap();
+
+            let wakes = Arc::new(WakeCounter::default());
+            let waker = Waker::from(wakes.clone());
+            let mut cx = Context::from_waker(&waker);
+            let mut storage = [[0u8; 1472]; 2];
+            let mut bufs = storage.each_mut().map(|buf| io::IoSliceMut::new(buf));
+            let mut metas = [noq_udp::RecvMeta::default(); 2];
+            let mut recv_infos: [RecvInfo; 2] = std::array::from_fn(|_| RecvInfo::default());
+
+            assert!(
+                transport
+                    .poll_recv(&mut cx, &mut bufs, &mut metas, &mut recv_infos)
+                    .is_pending()
+            );
+            assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+            assert_eq!(transport.relay_datagram_recv_queue.len(), 1);
+            assert!(matches!(
+                transport.poll_recv(&mut cx, &mut bufs, &mut metas, &mut recv_infos),
+                Poll::Ready(Ok(1))
+            ));
+            assert_eq!(&bufs[0][..metas[0].len], b"usable");
+            assert_eq!(metas[0].stride, 6);
+            assert_eq!(recv_infos[0].remote(), &Addr::Relay(url, src));
+            assert!(
+                transport
+                    .poll_recv(&mut cx, &mut bufs, &mut metas, &mut recv_infos)
+                    .is_pending()
+            );
+            assert_eq!(
+                wakes.0.load(Ordering::Relaxed),
+                1,
+                "empty queue must not self-wake"
+            );
+        }
     }
 }

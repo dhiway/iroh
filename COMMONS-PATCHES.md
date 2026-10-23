@@ -1,9 +1,47 @@
 # Local Commons development patches
 
-Base upstream source: `0072d7d84b233f9e7185eb676f049beaf557ac03`.
-This branch retains the separately reviewed native DNS lookup/lifecycle extension
-through `d9377db3e7ac784b73b66bedfacc64d5f840a3bd` (T268.77/.78).
-No upstream acceptance or deployment is claimed.
+Transition base upstream source: `55908a5809b61c72ec8deeff024038f4a9d68ab7` (1.4.0).
+The Commons source below is ported from reviewed `5469810f2098460d9a0ffc6d3e921999b733a0ef`,
+whose upstream base was `0072d7d84b233f9e7185eb676f049beaf557ac03` (1.3.0).
+The descriptions below record the original patches, including the separately
+reviewed DNS lookup/lifecycle extension through `d9377db3e7ac784b73b66bedfacc64d5f840a3bd`.
+
+## 1.4.0 transition and evaluation boundary
+
+The source port matches the reviewed AWS evaluation patch with SHA-256
+`3ca78b15f260591fb6817ae4befd4ab5ba5d2a2504a42410573b6152b29658c4`.
+Its selected Linux evaluation passed 12 groups (58 executions, 56 unique tests)
+for strict transport, discovery, injected DNS lookup and lifecycle behavior.
+This does not qualify the full workspace, downstream consumers, WAN operation
+or performance. The transition preserves both published fork and upstream ancestry.
+
+The production root patch pins Noq, Noq-proto and Noq-udp to
+`21aae6575c2c70ee8759f560a2778fcd61401f7d`, whose tree equals upstream 1.4.0
+plus the reviewed Retry-before-migration repair and regression tests. The
+experiment used a sibling path override with identical production Noq bytes;
+this committed Git-source composition still needs AWS lock regeneration and gates.
+Downstream Cargo roots must adopt the same patch identities: dependency-local
+Cargo patches do not propagate to consumers. There are no evaluation path overrides.
+
+The 1.4.0 manifests and upstream-generated lockfile remain the base. The DNS test
+manifest retains the existing Commons tower test dependency and public-type
+declarations. The owning AWS Cargo preparation must regenerate the tower edge
+and three Noq source identities, inspecting every other resolved change. No
+1.3.0 lockfile or Noq pin was copied. No upstream acceptance, consumer adoption,
+publication or deployment is claimed by this transition source preparation.
+
+The relay receive path uses upstream 1.4.0's compact output indexing and bounded
+self-wake, with Commons relay filtering inserted before accepting datagrams.
+Both upstream oversize/drop regressions and Commons foreign-relay regressions
+remain. Three Commons test fixtures destructure the upstream transport helper's
+new tuple return. DNS host fixtures explicitly retain the default listen backlog.
+
+Ordinary Pkarr resolution keeps upstream's explicit endpoint proxy behavior;
+Commons resolution keeps its separate direct, no-redirect/no-proxy constructor.
+Upstream asynchronous endpoint tracing, IPv6 QAD coverage, DNS header deadlines
+and listen backlogs, and captive-portal single-response/30-second timeout behavior
+are retained alongside Commons staged startup and awaited cleanup ownership.
+
 
 T268.110 adds `CMNS_TXT_NAME` and three explicit `EndpointInfo` methods for
 `_cmns` TXT/Pkarr records. They reuse native attribute codecs and packet types.
