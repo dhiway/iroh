@@ -646,7 +646,10 @@ mod tests {
             .count();
         assert_eq!(count, expected.len());
         let mut actual_index = Vec::new();
-        for row in snapshot.update_time.range(..).expect("timestamp index") {
+        for row in snapshot
+            .update_time
+            .range::<[u8; 8]>(..)
+            .expect("timestamp index") {
             let (time, keys) = row.expect("timestamp row");
             for key in keys {
                 actual_index.push((time.value(), key.expect("indexed key").value()));
@@ -714,9 +717,15 @@ mod tests {
         let first = read_packet("first.packet");
         let replacement = read_packet("replacement.packet");
         let other = read_packet("other.packet");
-        assert_eq!(first.public_key(), SecretKey::from_bytes(&[81; 32]).public());
+        assert_eq!(
+            first.public_key(),
+            SecretKey::from_bytes(&[81; 32]).public()
+        );
         assert_eq!(replacement.public_key(), first.public_key());
-        assert_eq!(other.public_key(), SecretKey::from_bytes(&[82; 32]).public());
+        assert_eq!(
+            other.public_key(),
+            SecretKey::from_bytes(&[82; 32]).public()
+        );
         assert!(replacement.more_recent_than(&first));
         let path = root.join("packets.redb");
         if phase != "create" {
@@ -732,7 +741,12 @@ mod tests {
                 .expect("open actual persistent store");
         if phase == "create" {
             assert!(store.upsert(first.clone()).await.expect("initial upsert"));
-            assert!(store.upsert(other.clone()).await.expect("independent upsert"));
+            assert!(
+                store
+                    .upsert(other.clone())
+                    .await
+                    .expect("independent upsert")
+            );
         }
         if phase == "verify" {
             assert_compat_contents(&store, &[replacement.clone(), other.clone()]).await;
