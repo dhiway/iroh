@@ -4469,6 +4469,13 @@ mod strict_relays_tests {
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             IpAddr::V6(Ipv6Addr::LOCALHOST),
         ] {
+            if let Err(err) = std::net::UdpSocket::bind((ip, 0)) {
+                if err.kind() == std::io::ErrorKind::AddrNotAvailable {
+                    eprintln!("skipping {ip}: loopback is unavailable ({err})");
+                    continue;
+                }
+                panic!("failed to bind {ip}: {err}");
+            }
             let build = || {
                 Builder::new(presets::Minimal)
                     .relay_allowlist([])

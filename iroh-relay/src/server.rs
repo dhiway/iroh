@@ -2309,6 +2309,8 @@ mod cleanup_tests {
                         tokio::task::yield_now().await
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
+                    // Windows reports a peer close after unread data as WSAECONNABORTED.
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionAborted => break,
                     Err(e) => panic!("captive fixture read: {e}"),
                 }
             }

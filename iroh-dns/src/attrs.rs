@@ -50,10 +50,10 @@ pub enum ParseError {
     },
     #[error("Record is not an `iroh` record, expected `_iroh`, got `{label}`")]
     NotAnIrohRecord { label: String },
-    #[error("Unexpected endpoint record name, expected `{expected}`, got `{label}`")]
-    UnexpectedRecordName { expected: String, label: String },
     #[error(transparent)]
     DecodingError { source: iroh_base::KeyParsingError },
+    #[error("Unexpected endpoint record name, expected `{expected}`, got `{label}`")]
+    UnexpectedRecordName { expected: String, label: String },
 }
 
 /// Parses a [`EndpointId`] from iroh DNS name.

@@ -191,6 +191,8 @@ jobs:
         MAX_WORKERS: ${{ inputs.max_workers }}
       run: |
         cd ../chuck/netsim
+        # setup.sh installs the Python deps with `pip --user`; sudo would hide them.
+        user_base="$(python3 -m site --user-base)"
         IFS=',' read -ra sim_paths <<< "$SIM_PATHS"
         filter_flag=""
         if [[ -n "$FILTER" ]]; then
@@ -204,9 +206,9 @@ jobs:
         fi
         for sim_path in "${sim_paths[@]}"; do
           if [[ -n "$RUST_LOG_INPUT" ]]; then
-            sudo RUST_LOG="$RUST_LOG_INPUT" python3 main.py ${filter_flag} --max-workers="$MAX_WORKERS" --integration "$sim_path"
+            sudo PYTHONUSERBASE="$user_base" RUST_LOG="$RUST_LOG_INPUT" python3 main.py ${filter_flag} --max-workers="$MAX_WORKERS" --integration "$sim_path"
           else
-            sudo python3 main.py ${filter_flag} --max-workers="$MAX_WORKERS" --integration "$sim_path"
+            sudo PYTHONUSERBASE="$user_base" python3 main.py ${filter_flag} --max-workers="$MAX_WORKERS" --integration "$sim_path"
           fi
         done
 
