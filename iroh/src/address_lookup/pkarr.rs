@@ -1090,8 +1090,9 @@ mod cmns_lookup_tests {
     }
     #[tokio::test]
     async fn strict_pkarr_redirects_and_exact_paths() {
-        use axum::{response::Redirect, routing::any};
         use std::{sync::Mutex, time::Duration};
+
+        use axum::{response::Redirect, routing::any};
         let hits = Arc::new(AtomicUsize::new(0));
         let paths = Arc::new(Mutex::new(Vec::new()));
         let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1175,8 +1176,9 @@ mod cmns_lookup_tests {
 
     #[tokio::test]
     async fn strict_pkarr_proxy_environment() {
-        use axum::routing::any;
         use std::time::Duration;
+
+        use axum::routing::any;
         const CHILD: &str = "T268_200_PROXY_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let hits = Arc::new(AtomicUsize::new(0));

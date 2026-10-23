@@ -4329,12 +4329,13 @@ mod tests {
 
 #[cfg(all(test, with_crypto_provider, not(wasm_browser)))]
 mod strict_relays_tests {
-    use super::*;
-    use crate::test_utils::run_relay_server;
     use std::{
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
         time::Duration,
     };
+
+    use super::*;
+    use crate::test_utils::run_relay_server;
     const ALPN: &[u8] = b"strict-relays-test";
 
     #[test]

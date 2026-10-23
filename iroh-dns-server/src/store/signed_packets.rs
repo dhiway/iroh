@@ -649,7 +649,8 @@ mod tests {
         for row in snapshot
             .update_time
             .range::<[u8; 8]>(..)
-            .expect("timestamp index") {
+            .expect("timestamp index")
+        {
             let (time, keys) = row.expect("timestamp row");
             for key in keys {
                 actual_index.push((time.value(), key.expect("indexed key").value()));
