@@ -16,7 +16,7 @@ This does not qualify the full workspace, downstream consumers, WAN operation
 or performance. The transition preserves both published fork and upstream ancestry.
 
 The production root patch pins Noq, Noq-proto and Noq-udp to
-`21aae6575c2c70ee8759f560a2778fcd61401f7d`, whose tree equals upstream 1.4.0
+`0f9a570dfc9f1f1d1280adc845cabe9bbc6146e6`, whose tree equals upstream 1.4.0
 plus the reviewed Retry-before-migration repair and regression tests. The
 experiment used a sibling path override with identical production Noq bytes;
 the committed Git-source lock was generated offline by Cargo on AWS.
