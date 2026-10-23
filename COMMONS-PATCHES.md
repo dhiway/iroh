@@ -16,10 +16,13 @@ This does not qualify the full workspace, downstream consumers, WAN operation
 or performance. The transition preserves both published fork and upstream ancestry.
 
 The production root patch pins Noq, Noq-proto and Noq-udp to
-`0f9a570dfc9f1f1d1280adc845cabe9bbc6146e6`, whose tree equals upstream 1.4.0
-plus the reviewed Retry-before-migration repair and regression tests. The
-experiment used a sibling path override with identical production Noq bytes;
-the committed Git-source lock was generated offline by Cargo on AWS.
+`d9284b76c4480b9771bee49831104578772450c9`, the reviewed, published Noq 1.4.0
+source retaining the Retry-before-migration repair and regression tests. Its
+AWS default/qlog workspace tests and strict Clippy passed; Windows CI timeouts
+remain under investigation, so no whole-CI pass is claimed.
+The initial experiment used a sibling path override before the subsequent Noq
+security/CI changes. Root-owned AWS Cargo generation must refresh the existing
+lock for this Git pin before exact-head qualification; it is not hand-edited.
 DNS persistence now requires redb 4.4.0; experimental database features and
 table encodings are unchanged. Exact-head native gates and downstream adoption
 remain pending qualification.
@@ -27,8 +30,8 @@ Downstream Cargo roots must adopt the same patch identities: dependency-local
 Cargo patches do not propagate to consumers. There are no evaluation path overrides.
 
 The 1.4.0 manifest versions remain the base. The committed AWS-generated lock
-now records the Commons tower test edge, three exact Noq Git source identities
-and DNS redb 4.4.0. The DNS test manifest retains the existing public-type
+records the Commons tower test edge, the preceding Noq Git source identities
+and DNS redb 4.4.0; the current Noq pin refresh remains pending. The DNS test manifest retains the existing public-type
 declarations. No 1.3.0 lockfile or Noq pin was copied. Exact-head gates and
 cross-version disk compatibility remain pending; no upstream acceptance,
 consumer adoption, publication or deployment is claimed by this source preparation.
