@@ -638,12 +638,11 @@ mod tests {
             .await
             .expect("snapshot request");
         let snapshot = recv.await.expect("committed snapshot");
-        let count = snapshot
-            .signed_packets
-            .iter()
-            .expect("packet rows")
-            .map(|row| row.expect("packet row"))
-            .count();
+        let mut count = 0;
+        for row in snapshot.signed_packets.iter().expect("packet rows") {
+            row.expect("packet row");
+            count += 1;
+        }
         assert_eq!(count, expected.len());
         let mut actual_index = Vec::new();
         for row in snapshot
