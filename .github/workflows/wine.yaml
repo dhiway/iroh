@@ -21,18 +21,9 @@ permissions:
   contents: read
 
 jobs:
-  pick-runner:
-    uses: "$/.github/workflows/pick-runner.yml"
-    with:
-      min_free_runners: 3
-    secrets:
-      RUNNER_READ_TOKEN: ${{ secrets.RUNNER_READ_TOKEN }}
-
   wine_test:
     name: Wine Sanity Check
-    needs: pick-runner
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_1) }}
-    # runs-on: [self-hosted, linux, X64]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -42,9 +33,29 @@ jobs:
         run: |
           # Use WineHQ for newer Wine with bcryptprimitives.dll support
           sudo dpkg --add-architecture i386
+          # Azure's Ubuntu mirror can stall on i386 indices. Keep third-party
+          # sources unchanged and use Ubuntu's standard HTTPS mirrors.
+          sudo python3 - <<'PYTHON'
+          from pathlib import Path
+          import re
+          paths = [Path('/etc/apt/sources.list')]
+          paths += list(Path('/etc/apt/sources.list.d').glob('*.list'))
+          paths += list(Path('/etc/apt/sources.list.d').glob('*.sources'))
+          for path in paths:
+              if not path.is_file():
+                  continue
+              text = path.read_text()
+              text = re.sub(r'https?://(?:azure\.archive|archive)\.ubuntu\.com/ubuntu\b',
+                            'https://archive.ubuntu.com/ubuntu', text)
+              text = re.sub(r'http://security\.ubuntu\.com/ubuntu\b',
+                            'https://security.ubuntu.com/ubuntu', text)
+              path.write_text(text)
+          PYTHON
+          # Bound repository failures; do not turn package/test failures into success.
+          echo 'Acquire::http::Timeout "30"; Acquire::https::Timeout "30"; Acquire::Retries "2";' | sudo tee /etc/apt/apt.conf.d/80-ci-timeouts >/dev/null
           sudo mkdir -pm755 /etc/apt/keyrings
-          sudo wget -O /etc/apt/keyrings/winehq-archive.key https://dl.winehq.org/wine-builds/winehq.key
-          sudo wget -NP /etc/apt/sources.list.d/ https://dl.winehq.org/wine-builds/ubuntu/dists/$(lsb_release -cs)/winehq-$(lsb_release -cs).sources
+          sudo wget --timeout=30 --tries=2 -O /etc/apt/keyrings/winehq-archive.key https://dl.winehq.org/wine-builds/winehq.key
+          sudo wget --timeout=30 --tries=2 -NP /etc/apt/sources.list.d/ https://dl.winehq.org/wine-builds/ubuntu/dists/$(lsb_release -cs)/winehq-$(lsb_release -cs).sources
           sudo apt-get update
           sudo apt-get install -y --install-recommends winehq-stable || sudo apt-get install -y wine64 wine32
           # Initialize Wine prefix

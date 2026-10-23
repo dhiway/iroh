@@ -25,9 +25,10 @@ jobs:
   patchbay_tests:
     name: Patchbay Tests
     timeout-minutes: 15
-    runs-on: [self-hosted, linux, X64]
+    runs-on: ubuntu-latest
     env:
       RUSTC_WRAPPER: "sccache"
+      SCCACHE_GHA_ENABLED: "on"
     steps:
       - name: Enable unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
