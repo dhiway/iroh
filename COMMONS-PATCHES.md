@@ -19,7 +19,10 @@ The production root patch pins Noq, Noq-proto and Noq-udp to
 `21aae6575c2c70ee8759f560a2778fcd61401f7d`, whose tree equals upstream 1.4.0
 plus the reviewed Retry-before-migration repair and regression tests. The
 experiment used a sibling path override with identical production Noq bytes;
-this committed Git-source composition still needs AWS lock regeneration and gates.
+the committed Git-source lock was generated offline by Cargo on AWS.
+DNS persistence now requires redb 4.4.0; experimental database features and
+table encodings are unchanged. Exact-head native gates and downstream adoption
+remain pending qualification.
 Downstream Cargo roots must adopt the same patch identities: dependency-local
 Cargo patches do not propagate to consumers. There are no evaluation path overrides.
 
