@@ -26,12 +26,12 @@ remain pending qualification.
 Downstream Cargo roots must adopt the same patch identities: dependency-local
 Cargo patches do not propagate to consumers. There are no evaluation path overrides.
 
-The 1.4.0 manifests and upstream-generated lockfile remain the base. The DNS test
-manifest retains the existing Commons tower test dependency and public-type
-declarations. The owning AWS Cargo preparation must regenerate the tower edge
-and three Noq source identities, inspecting every other resolved change. No
-1.3.0 lockfile or Noq pin was copied. No upstream acceptance, consumer adoption,
-publication or deployment is claimed by this transition source preparation.
+The 1.4.0 manifest versions remain the base. The committed AWS-generated lock
+now records the Commons tower test edge, three exact Noq Git source identities
+and DNS redb 4.4.0. The DNS test manifest retains the existing public-type
+declarations. No 1.3.0 lockfile or Noq pin was copied. Exact-head gates and
+cross-version disk compatibility remain pending; no upstream acceptance,
+consumer adoption, publication or deployment is claimed by this source preparation.
 
 The relay receive path uses upstream 1.4.0's compact output indexing and bounded
 self-wake, with Commons relay filtering inserted before accepting datagrams.
