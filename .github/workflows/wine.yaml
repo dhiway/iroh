@@ -38,7 +38,8 @@ jobs:
           sudo python3 - <<'PYTHON'
           from pathlib import Path
           import re
-          paths = [Path('/etc/apt/sources.list')]
+          paths = [Path('/etc/apt/sources.list'),
+                   Path('/etc/apt/apt-mirrors.txt')]
           paths += list(Path('/etc/apt/sources.list.d').glob('*.list'))
           paths += list(Path('/etc/apt/sources.list.d').glob('*.sources'))
           for path in paths:
