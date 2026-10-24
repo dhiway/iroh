@@ -25,29 +25,22 @@ permissions:
   contents: read
 
 jobs:
-  pick-runner:
-    uses: "./.github/workflows/pick-runner.yml"
-    with:
-      min_free_runners: 3
-    secrets:
-      RUNNER_READ_TOKEN: ${{ secrets.RUNNER_READ_TOKEN }}
-
   tests:
     name: CI Test Suite
     if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
-    uses: "./.github/workflows/tests.yaml"
+    uses: "$/.github/workflows/tests.yaml"
 
   min-crates:
     name: Min Crates
-    uses: "./.github/workflows/minimal-crates.yaml"
+    uses: "n0-computer/workflows/.github/workflows/minimal-crates.yaml@4e050c94c7d9679a2a0c4113a9cd6bfd3ec73194" # v1.1.1
+    with:
+      windows-runner: '["windows-latest"]'
 
   cross_build:
     name: Cross Build Only
     if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
     timeout-minutes: 30
-    needs: pick-runner
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_1) }}
-    # runs-on: [self-hosted, linux, X64]
+    runs-on: ubuntu-latest
     env:
       RUSTFLAGS: "-Dwarnings --cfg skip_patchbay"
     strategy:
@@ -71,7 +64,7 @@ jobs:
           submodules: recursive
 
       - name: Install rust stable
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: stable
 
@@ -90,7 +83,7 @@ jobs:
 
       - name: Install cross
         if: steps.cache-cross.outputs.cache-hit != 'true'
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cross
 
@@ -107,7 +100,7 @@ jobs:
     name: Android Build & Test
     if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
     timeout-minutes: 30
-    runs-on: [self-hosted, linux, X64]
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -131,13 +124,13 @@ jobs:
           sudo udevadm trigger --name-match=kvm
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: stable
           target: ${{ matrix.target }}
 
       - name: Setup Java
-        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: "temurin"
           java-version: "17"
@@ -263,9 +256,7 @@ jobs:
     name: Cross Test
     if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
     timeout-minutes: 30
-    needs: pick-runner
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_3) }}
-    # runs-on: [self-hosted, linux, X64]
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -281,7 +272,7 @@ jobs:
           submodules: recursive
 
       - name: Install rust stable
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: stable
 
@@ -300,7 +291,7 @@ jobs:
 
       - name: Install cross
         if: steps.cache-cross.outputs.cache-hit != 'true'
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cross
 
@@ -312,9 +303,7 @@ jobs:
 
   wasm_test:
     name: Build & test wasm32 for browsers
-    needs: pick-runner
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_4) }}
-    # runs-on: [self-hosted, linux, X64]
+    runs-on: ubuntu-latest
     env:
       RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
     steps:
@@ -324,12 +313,12 @@ jobs:
           persist-credentials: false
 
       - name: Setup node.js version 22.5 # needed for browser-like websocket API support in node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22.5
 
       - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: stable
 
@@ -337,7 +326,7 @@ jobs:
         run: rustup target add wasm32-unknown-unknown
 
       - name: Install wasm-bindgen-test-runner
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           # Match the version of wasm-bindgen used in Cargo.lock
           tool: wasm-bindgen-cli@0.2.128
@@ -368,9 +357,7 @@ jobs:
         run: cargo test --locked -p iroh --test integration --target=wasm32-unknown-unknown
 
   check_semver:
-    needs: pick-runner
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_5) }}
-    # runs-on: [self-hosted, linux, X64]
+    runs-on: ubuntu-latest
     env:
       RUSTC_WRAPPER: "sccache"
       SCCACHE_GHA_ENABLED: "on"
@@ -382,7 +369,7 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         continue-on-error: true
-      - uses: ./.github/workflows/sccache-probe
+      - uses: $/.github/workflows/sccache-probe
       - name: Check semver
         # uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2
         uses: n0-computer/cargo-semver-checks-action@b49de9133f8849bb51cae32c6bdeb19a5c37e61f # feat-baseline
@@ -393,9 +380,7 @@ jobs:
     timeout-minutes: 30
     name: Check external types in public API
     if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
-    needs: pick-runner
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_9) }}
-    # runs-on: [self-hosted, linux, X64]
+    runs-on: ubuntu-latest
     env:
       RUSTC_WRAPPER: "sccache"
       SCCACHE_GHA_ENABLED: "on"
@@ -412,14 +397,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ env.TOOLCHAIN }}
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: Install cargo-check-external-types
-        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: |
             cargo-make
@@ -442,14 +427,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: stable
           components: rustfmt
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         continue-on-error: true
-      - uses: ./.github/workflows/sccache-probe
-      - uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+      - uses: $/.github/workflows/sccache-probe
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-make
       - run: cargo make format-check
@@ -460,9 +445,7 @@ jobs:
   check_docs:
     timeout-minutes: 30
     name: Checking docs
-    needs: pick-runner
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_6) }}
-    # runs-on: [self-hosted, linux, X64]
+    runs-on: ubuntu-latest
     env:
       RUSTC_WRAPPER: "sccache"
       SCCACHE_GHA_ENABLED: "on"
@@ -471,22 +454,20 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: nightly-2025-10-09
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         continue-on-error: true
-      - uses: ./.github/workflows/sccache-probe
+      - uses: $/.github/workflows/sccache-probe
 
       - name: Docs
         run: cargo doc --locked --workspace --all-features --no-deps --document-private-items
 
   clippy_check:
     timeout-minutes: 30
-    needs: pick-runner
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_7) }}
-    # runs-on: [self-hosted, linux, X64]
+    runs-on: ubuntu-latest
     env:
       RUSTC_WRAPPER: "sccache"
       SCCACHE_GHA_ENABLED: "on"
@@ -494,14 +475,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: stable
           components: clippy
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         continue-on-error: true
-      - uses: ./.github/workflows/sccache-probe
+      - uses: $/.github/workflows/sccache-probe
 
       # TODO: We have a bunch of platform-dependent code so should
       #    probably run this job on the full platform matrix
@@ -522,7 +503,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: stable
       - name: Verify optional deps are absent without features
@@ -543,9 +524,7 @@ jobs:
     if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
     timeout-minutes: 30
     name: Minimal Supported Rust Version
-    needs: pick-runner
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_8) }}
-    # runs-on: [self-hosted, linux, X64]
+    runs-on: ubuntu-latest
     env:
       RUSTC_WRAPPER: "sccache"
       SCCACHE_GHA_ENABLED: "on"
@@ -553,13 +532,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ env.MSRV }}
       - name: Install sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         continue-on-error: true
-      - uses: ./.github/workflows/sccache-probe
+      - uses: $/.github/workflows/sccache-probe
 
       - name: Check MSRV all features
         run: |
@@ -584,7 +563,7 @@ jobs:
       contents: read
       pull-requests: write   # netsim_runner posts the report comment
     if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
-    uses: "./.github/workflows/netsim_runner.yaml"
+    uses: "$/.github/workflows/netsim_runner.yaml"
     secrets:
       S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
       S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
@@ -613,4 +592,4 @@ jobs:
           path: ~/.cache/pip
           key: pip-codespell-2.4.1
       - run: pip install --user codespell[toml]==2.4.1
-      - run: codespell --ignore-words-list=ans,atmost,crate,inout,ratatui,ser,stayin,swarmin,worl,keep-alives --skip=CHANGELOG.md
+      - run: codespell --ignore-words-list=ans,atmost,crate,inout,ratatui,ser,stayin,swarmin,worl,keep-alives,additionals --skip=CHANGELOG.md

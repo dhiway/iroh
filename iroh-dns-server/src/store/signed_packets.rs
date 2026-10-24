@@ -592,6 +592,206 @@ mod tests {
         assert_eq!(packet.as_bytes(), deserialized.as_bytes());
     }
 
+    const COMPAT_GUARD: &[u8] = b"iroh-dns-signed-packet-compat-v1\n";
+
+    fn compat_options() -> Options {
+        Options {
+            // One message per transaction makes the following Snapshot a
+            // committed-state barrier, rather than a view of the prior batch.
+            max_batch_size: 1,
+            // Keep synthetic packets away from wall-clock eviction. This
+            // duration's microseconds still fit in the native u64 conversion.
+            eviction: Duration::from_secs(u64::MAX / 1_000_000),
+            ..Options::default()
+        }
+    }
+
+    fn compat_read(root: &Path, name: &str) -> Vec<u8> {
+        let path = root.join(name);
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .expect("fixture file metadata")
+                .file_type()
+                .is_file(),
+            "fixture inputs must be regular files"
+        );
+        std::fs::read(path).expect("read fixture file")
+    }
+
+    async fn assert_compat_contents(store: &SignedPacketStore, expected: &[SignedPacket]) {
+        for packet in expected {
+            let key = PublicKeyBytes::from_signed_packet(packet);
+            let actual = store
+                .get(&key)
+                .await
+                .expect("get packet")
+                .expect("stored packet");
+            assert_eq!(actual.as_bytes(), packet.as_bytes());
+            let verified = SignedPacket::from_bytes(actual.as_bytes()).expect("native signature");
+            assert_eq!(verified.public_key(), packet.public_key());
+            assert_eq!(verified.timestamp(), packet.timestamp());
+        }
+        let (res, recv) = oneshot::channel();
+        store
+            .send
+            .send(Message::Snapshot { res })
+            .await
+            .expect("snapshot request");
+        let snapshot = recv.await.expect("committed snapshot");
+        let mut count = 0;
+        for row in snapshot.signed_packets.iter().expect("packet rows") {
+            row.expect("packet row");
+            count += 1;
+        }
+        assert_eq!(count, expected.len());
+        let mut actual_index = Vec::new();
+        for row in snapshot
+            .update_time
+            .range::<[u8; 8]>(..)
+            .expect("timestamp index")
+        {
+            let (time, keys) = row.expect("timestamp row");
+            for key in keys {
+                actual_index.push((time.value(), key.expect("indexed key").value()));
+            }
+        }
+        let mut expected_index: Vec<_> = expected
+            .iter()
+            .map(|packet| {
+                (
+                    packet.timestamp().to_be_bytes(),
+                    *packet.public_key().as_bytes(),
+                )
+            })
+            .collect();
+        actual_index.sort();
+        expected_index.sort();
+        assert_eq!(
+            actual_index, expected_index,
+            "stale or missing timestamp index entry"
+        );
+        // Snapshot/read guards leave scope before the store joins its threads.
+    }
+
+    async fn compat_phase(root: &Path, phase: &str) {
+        assert!(
+            root.is_absolute(),
+            "an absolute synthetic fixture root is required"
+        );
+        assert!(matches!(phase, "create" | "upgrade" | "verify"));
+        if phase == "create" {
+            assert!(!root.exists(), "create never reuses a fixture root");
+            std::fs::create_dir(root).expect("new fixture directory");
+            std::fs::write(root.join("fixture.kind"), COMPAT_GUARD).expect("fixture guard");
+            let key = SecretKey::from_bytes(&[81; 32]);
+            let first = SignedPacket::from_txt_strings(&key, "_compat", ["first"], 30)
+                .expect("first signed packet");
+            let replacement = SignedPacket::from_txt_strings(&key, "_compat", ["replacement"], 30)
+                .expect("replacement signed packet");
+            assert!(replacement.timestamp() > first.timestamp());
+            let other = SignedPacket::from_txt_strings(
+                &SecretKey::from_bytes(&[82; 32]),
+                "_compat",
+                ["other"],
+                30,
+            )
+            .expect("independent signed packet");
+            for (name, packet) in [
+                ("first.packet", first),
+                ("replacement.packet", replacement),
+                ("other.packet", other),
+            ] {
+                std::fs::write(root.join(name), packet.as_bytes()).expect("public packet fixture");
+            }
+        }
+        assert!(
+            std::fs::symlink_metadata(root)
+                .expect("fixture directory metadata")
+                .file_type()
+                .is_dir()
+        );
+        assert_eq!(compat_read(root, "fixture.kind"), COMPAT_GUARD);
+        let read_packet = |name| {
+            SignedPacket::from_bytes(&compat_read(root, name)).expect("verified fixture packet")
+        };
+        let first = read_packet("first.packet");
+        let replacement = read_packet("replacement.packet");
+        let other = read_packet("other.packet");
+        assert_eq!(
+            first.public_key(),
+            SecretKey::from_bytes(&[81; 32]).public()
+        );
+        assert_eq!(replacement.public_key(), first.public_key());
+        assert_eq!(
+            other.public_key(),
+            SecretKey::from_bytes(&[82; 32]).public()
+        );
+        assert!(replacement.more_recent_than(&first));
+        let path = root.join("packets.redb");
+        if phase != "create" {
+            assert!(
+                std::fs::symlink_metadata(&path)
+                    .expect("existing database")
+                    .file_type()
+                    .is_file()
+            );
+        }
+        let store =
+            SignedPacketStore::persistent(&path, compat_options(), Arc::new(Metrics::default()))
+                .expect("open actual persistent store");
+        if phase == "create" {
+            assert!(store.upsert(first.clone()).await.expect("initial upsert"));
+            assert!(
+                store
+                    .upsert(other.clone())
+                    .await
+                    .expect("independent upsert")
+            );
+        }
+        if phase == "verify" {
+            assert_compat_contents(&store, &[replacement.clone(), other.clone()]).await;
+        } else {
+            assert_compat_contents(&store, &[first.clone(), other.clone()]).await;
+        }
+        if phase == "upgrade" {
+            assert!(
+                store
+                    .upsert(replacement.clone())
+                    .await
+                    .expect("new-version write")
+            );
+        }
+        if phase != "create" {
+            assert!(!store.upsert(first).await.expect("older packet rejected"));
+            assert_compat_contents(&store, &[replacement, other]).await;
+        }
+        // Native Drop cancels both actors and IoThread::drop joins both
+        // threads. Keep the runtime alive until those joins finish; only
+        // reopen the database after this returns.
+        drop(store);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persistent_signed_packets_and_timestamp_index_survive_reopen() {
+        let parent = tempfile::tempdir().expect("synthetic fixture parent");
+        let root = parent.path().join("packets");
+        for phase in ["create", "upgrade", "verify"] {
+            compat_phase(&root, phase).await;
+        }
+    }
+
+    /// Compile the SAME test with the old redb 4.3 graph (create), then
+    /// the new redb 4.4 graph (upgrade and verify), in separate processes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "cross-version runner supplies a fresh absolute synthetic root and explicit phase"]
+    async fn signed_packet_store_dependency_fixture() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("IROH_DNS_REDB_COMPAT_ROOT").expect("fixture root required"),
+        );
+        let phase = std::env::var("IROH_DNS_REDB_COMPAT_PHASE").expect("fixture phase required");
+        compat_phase(&root, &phase).await;
+    }
+
     #[tokio::test]
     async fn remove_in_memory() {
         let store = SignedPacketStore::in_memory(Options::default(), Arc::new(Metrics::default()))

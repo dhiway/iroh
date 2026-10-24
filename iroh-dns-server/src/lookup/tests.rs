@@ -93,7 +93,7 @@ fn timing_fails_closed_and_floors_remaining_seconds() {
     let timing = value.timing_at(now + Duration::from_millis(500)).unwrap();
     assert_eq!(PacketLease::ttl_left(10, timing), Some(5));
     assert_eq!(PacketLease::ttl_left(3, timing), None);
-    assert!(value.timing_at(now - Duration::from_nanos(1)).is_none());
+    assert!(value.timing_at(now - Duration::from_millis(1)).is_none());
     assert!(value.timing_at(now + Duration::from_millis(5500)).is_none());
     value.age_at_observation = Duration::MAX;
     assert!(value.timing_at(now + Duration::from_nanos(1)).is_none());

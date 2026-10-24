@@ -321,10 +321,12 @@ mod lifecycle_tests {
         config.http = http.then_some(HttpConfig {
             port: 0,
             bind_addr: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            listen_backlog: None,
         });
         config.https = https.then_some(HttpsConfig {
             port: 0,
             bind_addr: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            listen_backlog: None,
             domains: vec!["localhost".to_owned()],
             cert_mode: CertMode::SelfSigned,
             letsencrypt_contact: None,

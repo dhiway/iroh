@@ -40,7 +40,7 @@ missing_debug_implementations = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(iroh_docsrs)", "cfg(iroh_loom)", "cfg(skip_patchbay)"] }
 
 [workspace.lints.clippy]
-unused-async = "warn"
+unused_async = "warn"
 
 [workspace.metadata.cargo-semver-checks.lints]
 enum_struct_variant_field_marked_deprecated = { required-update = "minor" }
@@ -58,3 +58,9 @@ trait_method_marked_deprecated = { required-update = "minor" }
 type_associated_const_marked_deprecated = { required-update = "minor" }
 type_marked_deprecated = { required-update = "minor" }
 type_method_marked_deprecated = { required-update = "minor" }
+
+# Commons Retry validation must precede handshake path migration.
+[patch.crates-io]
+noq = { git = "https://github.com/dhiway/noq", rev = "d7abd611bef1a9abaebf5e9dc97bd619d0c77e60" }
+noq-proto = { git = "https://github.com/dhiway/noq", rev = "d7abd611bef1a9abaebf5e9dc97bd619d0c77e60" }
+noq-udp = { git = "https://github.com/dhiway/noq", rev = "d7abd611bef1a9abaebf5e9dc97bd619d0c77e60" }
