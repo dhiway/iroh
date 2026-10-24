@@ -16,8 +16,10 @@ This does not qualify the full workspace, downstream consumers, WAN operation
 or performance. The transition preserves both published fork and upstream ancestry.
 
 The production root patch pins Noq, Noq-proto and Noq-udp to
-`d7abd611bef1a9abaebf5e9dc97bd619d0c77e60` (dhiway/noq commons-v1.0 after PR #1), the reviewed, published Noq 1.4.0
-source retaining the Retry-before-migration repair and regression tests. Its
+`0b814aebbcdd121938562ab216cb1eb5f11daa8f` (dhiway/noq commons-v1.0 after T209.415), the reviewed, published Noq 1.4.0
+source retaining the Retry-before-migration repair and regression tests, and
+discarding a Retry received by a server and an inadmissible Version Negotiation
+before any connection state change. Its
 AWS-generated lockfile uses that same Git identity. DNS persistence requires
 redb 4.4.0; experimental database features and table encodings are unchanged.
 The lock retains the Commons tower test dependency and the 1.4.0 manifest versions.
