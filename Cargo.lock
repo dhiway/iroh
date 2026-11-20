@@ -3122,7 +3122,7 @@ checksum = "38bf9645c8b145698bb0b18a4637dcacbc421ea49bef2317e4fd8065a387cf21"
 [[package]]
 name = "noq"
 version = "1.5.0"
-source = "git+https://github.com/dhiway/noq?rev=09f243a3217ec719f0ab97444a0aebbf509d5804#09f243a3217ec719f0ab97444a0aebbf509d5804"
+source = "git+https://github.com/dhiway/noq?rev=a651c1353017ab6643ea65880ce390fcd2df547d#a651c1353017ab6643ea65880ce390fcd2df547d"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -3143,7 +3143,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.5.0"
-source = "git+https://github.com/dhiway/noq?rev=09f243a3217ec719f0ab97444a0aebbf509d5804#09f243a3217ec719f0ab97444a0aebbf509d5804"
+source = "git+https://github.com/dhiway/noq?rev=a651c1353017ab6643ea65880ce390fcd2df547d#a651c1353017ab6643ea65880ce390fcd2df547d"
 dependencies = [
  "aes-gcm",
  "aws-lc-rs",
@@ -3173,7 +3173,7 @@ dependencies = [
 [[package]]
 name = "noq-udp"
 version = "1.5.0"
-source = "git+https://github.com/dhiway/noq?rev=09f243a3217ec719f0ab97444a0aebbf509d5804#09f243a3217ec719f0ab97444a0aebbf509d5804"
+source = "git+https://github.com/dhiway/noq?rev=a651c1353017ab6643ea65880ce390fcd2df547d#a651c1353017ab6643ea65880ce390fcd2df547d"
 dependencies = [
  "cfg_aliases",
  "libc",
