@@ -21,6 +21,7 @@ allow = [
 [advisories]
 yanked = "deny"
 ignore = [
+  "RUSTSEC-2023-0089", # unmaintained: postcard -> heapless -> atomic-polyfill
   "RUSTSEC-2026-0542", # Unmaintained humantime: DNS duration parsing and qlog.
   "RUSTSEC-2026-0543", # Unmaintained chrono: test clocks, netwatch and its Windows backend.
 ]
