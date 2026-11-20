@@ -61,6 +61,6 @@ type_method_marked_deprecated = { required-update = "minor" }
 
 # Commons Retry validation must precede handshake path migration.
 [patch.crates-io]
-noq = { git = "https://github.com/dhiway/noq", rev = "b859916369af62164299f0eb0a63e043431dd3e3" }
-noq-proto = { git = "https://github.com/dhiway/noq", rev = "b859916369af62164299f0eb0a63e043431dd3e3" }
-noq-udp = { git = "https://github.com/dhiway/noq", rev = "b859916369af62164299f0eb0a63e043431dd3e3" }
+noq = { git = "https://github.com/dhiway/noq", rev = "09f243a3217ec719f0ab97444a0aebbf509d5804" }
+noq-proto = { git = "https://github.com/dhiway/noq", rev = "09f243a3217ec719f0ab97444a0aebbf509d5804" }
+noq-udp = { git = "https://github.com/dhiway/noq", rev = "09f243a3217ec719f0ab97444a0aebbf509d5804" }

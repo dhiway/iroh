@@ -4,7 +4,7 @@
 
 The upstream release is `ea3bbb6ab41fa23816d7f9e3220ab77d444435b2`. The
 workspace selects Commons Noq 1.5.0 at
-`b859916369af62164299f0eb0a63e043431dd3e3`. Consumers must repeat that
+`09f243a3217ec719f0ab97444a0aebbf509d5804`. Consumers must repeat that
 patch in each independent Cargo root. The release supplies native stream
 affinity and path waits. Applications select the policy for their own streams.
 
