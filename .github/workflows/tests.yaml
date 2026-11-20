@@ -35,52 +35,24 @@ jobs:
   build_and_test_nix:
     timeout-minutes: 30
     name: "Tests"
-    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    runs-on: ${{ matrix.runs_on }}
     strategy:
       fail-fast: false
       matrix:
         name: [ubuntu-latest, macOS-arm-latest]
         rust: ["${{ inputs.rust-version }}"]
         features: [all, none, default]
-        include:                                                                                                                                                         
-            # Standard hosted Linux runners.
-            - name: ubuntu-latest                                                                                   
-              features: all                                                                                                                                                
-              os: ubuntu-latest
-              release-os: linux                                                                                                                                            
-              release-arch: amd64                                                                                                                                          
-              runs_on: '["ubuntu-latest"]'
-            - name: ubuntu-latest                                                                                                                                          
-              features: none                                                                                                                                               
-              os: ubuntu-latest       
-              release-os: linux                                                                                                                                            
-              release-arch: amd64                                                                                   
-              runs_on: '["ubuntu-latest"]'
-            - name: ubuntu-latest                                                                                                                                          
-              features: default
-              os: ubuntu-latest                                                                                                                                            
-              release-os: linux                                                                                     
-              release-arch: amd64     
-              runs_on: '["ubuntu-latest"]'
-            # Standard hosted Apple Silicon runners.
-            - name: macOS-arm-latest                                                                                                                                       
-              features: all                                                                                                                                                
-              os: macOS-latest                                                                                                                                             
-              release-os: darwin                                                                                                                                           
-              release-arch: aarch64   
-              runs_on: '["macos-latest"]'
-            - name: macOS-arm-latest                                                                                
-              features: none                                                                                                                                               
-              os: macOS-latest
-              release-os: darwin                                                                                                                                           
-              release-arch: aarch64                                                                                 
-              runs_on: '["macos-latest"]'
-            - name: macOS-arm-latest                                                                                                                                       
-              features: default
-              os: macOS-latest                                                                                                                                             
-              release-os: darwin                                                                                    
-              release-arch: aarch64   
-              runs_on: '["macos-latest"]'
+        include:
+          - name: ubuntu-latest
+            os: ubuntu-latest
+            release-os: linux
+            release-arch: amd64
+            runs_on: ubuntu-latest
+          - name: macOS-arm-latest
+            os: macOS-latest
+            release-os: darwin
+            release-arch: aarch64
+            runs_on: macos-26
     env:
       RUSTC_WRAPPER: "sccache"
       SCCACHE_GHA_ENABLED: "on"
@@ -92,12 +64,12 @@ jobs:
           ref: ${{ inputs.git-ref }}
 
       - name: Install ${{ matrix.rust }} rust
-        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ matrix.rust }}
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
 
@@ -188,7 +160,7 @@ jobs:
   build_and_test_windows:
     timeout-minutes: 30
     name: "Tests"
-    runs-on: ${{ fromJSON(matrix.runs_on) }}
+    runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
@@ -197,27 +169,13 @@ jobs:
         features: [all, none, default]
         target:
           - x86_64-pc-windows-msvc
-        include:
-          # Standard hosted Windows runners.
-          - name: windows-latest
-            features: all
-            os: windows
-            runs_on: '["windows-latest"]'
-          - name: windows-latest
-            features: none
-            os: windows
-            runs_on: '["windows-latest"]'
-          - name: windows-latest
-            features: default
-            os: windows
-            runs_on: '["windows-latest"]'
     env:
       RUSTC_WRAPPER: "sccache"
       SCCACHE_GHA_ENABLED: "on"
       # Installing a toolchain does not select it, so without this every cargo
       # invocation below uses whatever the runner image ships as rustup default.
-      # As an env var this applies to the job only; `rustup default` would
-      # rewrite the runner image default for later steps.
+      # As an env var this applies to the job only and leaves the image's
+      # rustup default untouched.
       RUSTUP_TOOLCHAIN: "${{ matrix.rust }}"
     steps:
       - name: Checkout
@@ -244,7 +202,7 @@ jobs:
       # Was a bare Invoke-WebRequest from get.nexte.st with no checksum,
       # unpacked into ~/.cargo/bin on a long-lived host.
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
 
@@ -276,9 +234,8 @@ jobs:
 
       - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
         with:
-          # Blacksmith's Windows image ships no pre-installed MSYS2 (C:\msys64),
-          # so install it there. GitHub-hosted images keep the pre-installed one (faster).
-          release: ${{ startsWith(runner.name, 'blacksmith-') }}
+          # Blacksmith's Windows image ships no pre-installed MSYS2 (C:\msys64).
+          release: true
 
       - name: Install aws-lc-sys build dependencies
         shell: powershell

@@ -9,8 +9,6 @@ runs:
   using: composite
   steps:
     - name: Probe sccache backend
-      # All callers run on GitHub-hosted runners with the GHA cache backend,
-      # including Windows, where `shell: bash` resolves to Git Bash.
       if: env.RUSTC_WRAPPER == 'sccache'
       shell: bash
       env:

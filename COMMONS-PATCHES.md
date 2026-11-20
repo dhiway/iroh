@@ -1,5 +1,25 @@
 # Local Commons development patches
 
+## 1.5.0 transition
+
+The upstream release is `ea3bbb6ab41fa23816d7f9e3220ab77d444435b2`. The
+workspace selects Commons Noq 1.5.0 at
+`b859916369af62164299f0eb0a63e043431dd3e3`. Consumers must repeat that
+patch in each independent Cargo root. The release supplies native stream
+affinity and path waits. Applications select the policy for their own streams.
+
+The relay runs upstream’s establishment deadline inside the task tracked by
+the Commons shutdown owner. The deadline covers upgrade, authentication and
+authorization. Shutdown also cancels and joins outstanding upgrades, including
+those whose deadline has not expired. Relay receive filtering admits only
+permitted routes and retains upstream’s handling of empty datagrams. DNS
+persistence, scoped Commons records and direct Pkarr lookup retain the
+contracts below. GitHub-hosted workflows remain usable by the fork. Dependency
+advisories are assessed against its own resolved graph.
+
+## Earlier transitions
+
+
 Transition base upstream source: `55908a5809b61c72ec8deeff024038f4a9d68ab7` (1.4.0).
 The Commons source below is ported from reviewed `5469810f2098460d9a0ffc6d3e921999b733a0ef`,
 whose upstream base was `0072d7d84b233f9e7185eb676f049beaf557ac03` (1.3.0).
